@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<title>Popup</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="popup.css">
+</head>
+<body>
+<div id="app">
+  <!-- LOGIN VIEW -->
+  <div id="login-view" class="view">
+    <div class="login-form">
+      <input type="email" id="email" placeholder="email">
+      <input type="text" id="code" placeholder="code">
+      <button id="login-btn">VERIFY</button>
+      <div id="login-error"></div>
+    </div>
+  </div>
+
+  <!-- MAIN VIEW -->
+  <div id="main-view" class="view" style="display:none">
+    <!-- STATS -->
+    <div class="box">
+      <div class="box-title">Stats</div>
+      <div class="top">
+        <canvas id="gauge" width="120" height="120"></canvas>
+        <div class="stats">
+          <div><span id="err">0</span> ERR</div>
+          <div><span id="ok">0</span> OK</div>
+          <button id="reset">RESET</button>
+        </div>
+      </div>
+      <div class="delais-rectangles">
+        <div class="delay-rect"></div>
+        <div class="delay-rect"></div>
+        <div class="delay-rect"></div>
+      </div>
+      <div class="delais-controls">
+        <button id="delay-minus">-</button>
+        <span id="delay-value">1000</span>
+        <span>ms</span>
+        <button id="delay-plus">+</button>
+      </div>
+    </div>
+    <!-- SETTINGS -->
+    <div class="box">
+      <div class="box-title">Settings</div>
+      <div class="settings">
+        <div class="setting">
+          <span>AUTO</span>
+          <label class="switch">
+            <input type="checkbox" id="auto">
+            <span class="slider"></span>
+          </label>
+        </div>
+        <div class="setting">
+          <span>NET</span>
+          <label class="switch">
+            <input type="checkbox" id="net">
+            <span class="slider"></span>
+          </label>
+        </div>
+        <div class="setting">
+          <span>HL</span>
+          <label class="switch">
+            <input type="checkbox" id="hl">
+            <span class="slider"></span>
+          </label>
+        </div>
+        <div class="setting">
+          <span>COL</span>
+          <input type="color" id="hlColor" value="yellow">
+        </div>
+      </div>
+    </div>
+    <!-- LEVELS -->
+    <div class="box box-flex">
+      <div class="box-title">Levels loaded</div>
+      <ul id="list"></ul>
+    </div>
+  </div>
+</div>
+<script src="popup.js"></script>
+</body>
+</html>

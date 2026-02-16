@@ -1,0 +1,43 @@
+
+{
+  "manifest_version": 3,
+  "name": "Decrypt",
+  "version": "1.1",
+  "description": 
+  "Déchiffre les niveaus du site projet voltaire sotcke les réponses les affiches au fur et à mesure que le niveau se poursuit. Cette extension peut aussi remplir les champs automatiquement",
+  "permissions": [
+    "storage",
+    "webRequest",
+    "webRequestBlocking",
+    "webRequestFilterResponse"
+  ],
+  "host_permissions": [
+    "https://apprentissage.appli3.projet-voltaire.fr/*",
+    "https://content-prd.projet-voltaire.fr/v55/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "scripts": ["background.js"]
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "voltaire@ext.local",
+      "strict_min_version": "102.0",
+      "data_collection_permissions": {
+        "required": ["none"],
+        "optional": []
+      }
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://apprentissage.appli3.projet-voltaire.fr/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  }
+}
