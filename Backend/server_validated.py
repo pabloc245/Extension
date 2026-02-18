@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-"""
-Serveur d'authentification avec bibliothèques de validation
-"""
+
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import json
 import jwt
@@ -20,6 +18,8 @@ from dotenv import load_dotenv
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
 import binascii
+import ipaddress
+import stripe
 
 # Charger le fichier .env
 load_dotenv()
@@ -57,6 +57,18 @@ SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 AES_KEY = os.getenv("AES_KEY", "")  # 64 caractères hex (32 bytes)
 AES_IV = os.getenv("AES_IV", "")    # 32 caractères hex (16 bytes)
 
+# Stripe Config
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
+
+
+# Format: liste d'IPs séparées par des virgules dans TRUSTED_PROXIES
+TRUSTED_PROXIES = set(
+    ip.strip()
+    for ip in os.getenv("TRUSTED_PROXIES", "").split(",")
+    if ip.strip()
+)
+
 rate_limits = {}
 
 def init_db():
@@ -67,8 +79,26 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS users (
         email TEXT PRIMARY KEY,
         created_at TIMESTAMP,
-        last_login TIMESTAMP
+        last_login TIMESTAMP,
+        stripe_customer_id TEXT,
+        stripe_subscription_id TEXT,
+        subscription_status TEXT DEFAULT 'inactive',
+        subscription_ends_at TIMESTAMP,
+        decode_attempts INTEGER DEFAULT 0
     )''')
+    
+    # Migrations pour les bases existantes
+    for column, definition in [
+        ('stripe_customer_id',      'TEXT'),
+        ('stripe_subscription_id',  'TEXT'),
+        ('subscription_status',     "TEXT DEFAULT 'inactive'"),
+        ('subscription_ends_at',    'TIMESTAMP'),
+        ('decode_attempts',         'INTEGER DEFAULT 0'),
+    ]:
+        try:
+            c.execute(f'ALTER TABLE users ADD COLUMN {column} {definition}')
+        except sqlite3.OperationalError:
+            pass  # Colonne déjà existante
     
     c.execute('''CREATE TABLE IF NOT EXISTS codes (
         email TEXT PRIMARY KEY,
@@ -87,46 +117,53 @@ def init_db():
     conn.close()
 
 def sanitize_email(email_input):
+    # Vérification de type stricte — rejette int, list, dict, etc.
+    if not isinstance(email_input, str):
+        logging.warning(f"Invalid email type: {type(email_input)}")
+        return None
+
+    # Limite RFC 5321 : 254 chars max — coupe court avant email-validator
+    if len(email_input) > 254:
+        logging.warning("Email input exceeds RFC max length (254)")
+        return None
+
     try:
         emailinfo = validate_email(email_input, check_deliverability=False)
-        normalized_email = emailinfo.normalized
-        
-        # Escape HTML au cas où (defense in depth)
-        safe_email = html.escape(normalized_email)
-        
-        return safe_email
-        
+        # email-validator retourne déjà un email normalisé et sûr
+        return emailinfo.normalized
+
     except EmailNotValidError as e:
         logging.warning(f"Invalid email attempt: {email_input} - {str(e)}")
         return None
 
 def sanitize_code(code_input):
-    """Validation code de vérification"""
+    """Validation code de vérification — doit être exactement 6 chiffres"""
+    # Vérification de type stricte
     if not isinstance(code_input, str):
         return None
-    
-    # Bleach pour nettoyer
-    clean_code = bleach.clean(code_input.strip())
-    
-    # Doit être exactement 6 chiffres
-    if not clean_code.isdigit() or len(clean_code) != 6:
+
+    stripped = code_input.strip()
+
+    # Doit être exactement 6 chiffres — isdigit() suffit, bleach n'apporte rien ici
+    if not stripped.isdigit() or len(stripped) != 6:
         return None
-    
-    return clean_code
+
+    return stripped
 
 def sanitize_ip(ip_input):
-    """Validation IP"""
+    """Validation IP — vérifie le format réel avec ipaddress (IPv4 et IPv6)"""
     if not isinstance(ip_input, str):
         return "unknown"
-    
-    # Bleach pour nettoyer
-    clean_ip = bleach.clean(ip_input.strip())
-    
-    # Limite longueur (IPv6 max = 45 chars)
-    if len(clean_ip) > 45:
+
+    stripped = ip_input.strip()
+
+    try:
+        # ipaddress.ip_address() lève ValueError si ce n'est pas une IP valide
+        ipaddress.ip_address(stripped)
+        return stripped
+    except ValueError:
+        logging.warning(f"Invalid IP format: {stripped!r}")
         return "unknown"
-    
-    return clean_ip
 
 def hex_to_bytes(hex_string):
     """Convertit hexadécimal en bytes"""
@@ -307,27 +344,39 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get('Content-Length', 0))
             if length > 10000:  # Max 10KB
                 return {}
-            
+
             body_bytes = self.rfile.read(length) if length else b'{}'
             body_str = body_bytes.decode('utf-8')
-            
-            # Bleach pour nettoyer le JSON brut (paranoia)
-            clean_body = bleach.clean(body_str)
-            
-            return json.loads(clean_body)
+
+            # Parse JSON directement — chaque champ est sanitisé individuellement ensuite
+            parsed = json.loads(body_str)
+
+            # On n'accepte que des objets JSON (dict), pas des arrays ou primitives
+            if not isinstance(parsed, dict):
+                logging.warning("JSON body is not an object")
+                return {}
+
+            return parsed
         except Exception as e:
             logging.warning(f"Invalid body: {e}")
             return {}
     
     def _get_ip(self):
-        """Get real IP (handles proxies)"""
-        forwarded = self.headers.get('X-Forwarded-For')
-        if forwarded:
-            ip = forwarded.split(',')[0].strip()
-        else:
-            ip = self.client_address[0]
-        
-        return sanitize_ip(ip)
+        """
+        Récupère la vraie IP cliente.
+        X-Forwarded-For n'est accepté que si la requête vient d'un proxy de confiance
+        (défini dans TRUSTED_PROXIES), pour éviter le spoofing du rate limiting.
+        """
+        direct_ip = self.client_address[0]
+
+        if direct_ip in TRUSTED_PROXIES:
+            forwarded = self.headers.get('X-Forwarded-For')
+            if forwarded:
+                # Prendre la première IP de la chaîne (IP originale du client)
+                ip = forwarded.split(',')[0].strip()
+                return sanitize_ip(ip)
+
+        return sanitize_ip(direct_ip)
     
     def _log_failed_attempt(self, ip, email):
         """Log failed attempts"""
@@ -433,32 +482,167 @@ class Handler(BaseHTTPRequestHandler):
                 # Vérifier config AES
                 if not AES_KEY or not AES_IV:
                     return self._send_json({'error': 'AES not configured'}, 500)
-                
+
+                # Authentification requise pour /decode
+                auth = self.headers.get('Authorization', '')
+                if not auth.startswith('Bearer '):
+                    return self._send_json({'error': 'Non authentifié'}, 401)
+
+                email = verify_token(auth[7:])
+                if not email:
+                    return self._send_json({'error': 'Token invalide'}, 401)
+
+                # Récupérer l'utilisateur et ses infos subscription
+                c.execute(
+                    'SELECT decode_attempts, subscription_status, subscription_ends_at FROM users WHERE email = ?',
+                    (email,)
+                )
+                user_row = c.fetchone()
+                if not user_row:
+                    return self._send_json({'error': 'Utilisateur non trouvé'}, 404)
+
+                decode_attempts, sub_status, sub_ends_at = user_row
+
+                # Au-delà de 3 tentatives : subscription active requise
+                FREE_TIER_LIMIT = 3
+                if decode_attempts >= FREE_TIER_LIMIT:
+                    is_active = sub_status == 'active'
+                    # Vérifier aussi que l'abonnement n'est pas expiré
+                    if is_active and sub_ends_at:
+                        try:
+                            if datetime.fromisoformat(sub_ends_at) < datetime.utcnow():
+                                is_active = False
+                        except (ValueError, TypeError):
+                            is_active = False
+
+                    if not is_active:
+                        logging.warning(f"Decode attempt over free tier limit for {email} (attempts={decode_attempts})")
+                        return self._send_json({
+                            'error': 'subscription_required',
+                            'message': 'Vous avez atteint la limite gratuite (3 déchiffrements). Un abonnement actif est requis pour continuer.',
+                            'decode_attempts': decode_attempts,
+                            'limit': FREE_TIER_LIMIT
+                        }, 402)
+
                 try:
-                    # Récupérer les données chiffrées (raw binary)
                     length = int(self.headers.get('Content-Length', 0))
                     if length == 0:
                         return self._send_json({'error': 'No data provided'}, 400)
-                    
+
                     encrypted_data = self.rfile.read(length)
-                    
-                    # Déchiffrer
+
                     decrypted = decrypt_aes_cbc(encrypted_data, AES_KEY, AES_IV)
-                    
+
                     if decrypted is None:
                         return self._send_json({'error': 'Decryption failed'}, 400)
-                    
-                    logging.info(f"Data decrypted successfully from {ip}")
-                    
+
+                    # Incrémenter le compteur seulement sur succès
+                    c.execute(
+                        'UPDATE users SET decode_attempts = decode_attempts + 1 WHERE email = ?',
+                        (email,)
+                    )
+                    conn.commit()
+
+                    logging.info(f"Data decrypted successfully for {email} from {ip} (attempt #{decode_attempts + 1})")
+
                     return self._send_json({
                         'success': True,
-                        'data': decrypted
+                        'data': decrypted,
+                        'decode_attempts': decode_attempts + 1,
+                        'limit': FREE_TIER_LIMIT
                     })
-                    
+
                 except Exception as e:
                     logging.error(f"Decode error: {e}")
                     return self._send_json({'error': 'Internal error'}, 500)
             
+            # Route: Webhook Stripe
+            elif self.path == '/webhook':
+                if not STRIPE_WEBHOOK_SECRET:
+                    logging.error("STRIPE_WEBHOOK_SECRET not configured")
+                    return self._send_json({'error': 'Webhook not configured'}, 500)
+
+                length = int(self.headers.get('Content-Length', 0))
+                if length == 0:
+                    return self._send_json({'error': 'No payload'}, 400)
+
+                # Payload raw bytes obligatoire — ne pas passer par _get_body()
+                payload = self.rfile.read(length)
+                sig_header = self.headers.get('Stripe-Signature')
+
+                if not sig_header:
+                    logging.warning(f"Webhook call without Stripe-Signature from {ip}")
+                    return self._send_json({'error': 'Missing signature'}, 400)
+
+                try:
+                    event = stripe.Webhook.construct_event(
+                        payload, sig_header, STRIPE_WEBHOOK_SECRET
+                    )
+                except stripe.error.SignatureVerificationError:
+                    logging.warning(f"Invalid Stripe signature from {ip}")
+                    return self._send_json({'error': 'Invalid signature'}, 400)
+                except Exception as e:
+                    logging.error(f"Webhook parse error: {e}")
+                    return self._send_json({'error': 'Invalid payload'}, 400)
+
+                obj = event['data']['object']
+                event_type = event['type']
+                logging.info(f"Stripe event received: {event_type}")
+
+                if event_type == 'checkout.session.completed':
+                    # Récupérer l'email via metadata (le plus fiable) ou customer_email
+                    email = (obj.get('metadata') or {}).get('user_email') or obj.get('customer_email')
+                    if email:
+                        c.execute(
+                            '''UPDATE users SET
+                                stripe_customer_id = ?,
+                                stripe_subscription_id = ?,
+                                subscription_status = 'active',
+                                subscription_ends_at = NULL
+                               WHERE email = ?''',
+                            (obj.get('customer'), obj.get('subscription'), email)
+                        )
+                        conn.commit()
+                        logging.info(f"Subscription activated for {email}")
+                    else:
+                        logging.warning(f"checkout.session.completed: no email found in event {event['id']}")
+
+                elif event_type == 'customer.subscription.deleted':
+                    # Abonnement résilié — on identifie l'user par son subscription_id
+                    c.execute(
+                        '''UPDATE users SET
+                            subscription_status = 'inactive',
+                            subscription_ends_at = ?
+                           WHERE stripe_subscription_id = ?''',
+                        (datetime.utcnow(), obj.get('id'))
+                    )
+                    conn.commit()
+                    logging.info(f"Subscription deleted: {obj.get('id')}")
+
+                elif event_type == 'customer.subscription.updated':
+                    # Changement de statut (ex: trial → active, active → past_due)
+                    stripe_status = obj.get('status')  # 'active', 'past_due', 'canceled', etc.
+                    # On mappe les statuts Stripe vers nos statuts internes
+                    internal_status = 'active' if stripe_status == 'active' else 'inactive'
+                    c.execute(
+                        'UPDATE users SET subscription_status = ? WHERE stripe_subscription_id = ?',
+                        (internal_status, obj.get('id'))
+                    )
+                    conn.commit()
+                    logging.info(f"Subscription updated: {obj.get('id')} → {internal_status}")
+
+                elif event_type == 'invoice.payment_failed':
+                    # Paiement échoué — on passe en past_due sans couper l'accès immédiatement
+                    c.execute(
+                        'UPDATE users SET subscription_status = ? WHERE stripe_customer_id = ?',
+                        ('past_due', obj.get('customer'))
+                    )
+                    conn.commit()
+                    logging.warning(f"Payment failed for customer: {obj.get('customer')}")
+
+                # Stripe exige un 200 rapide — toujours répondre même pour les events non gérés
+                return self._send_json({'received': True})
+
             return self._send_json({'error': 'Route non trouvée'}, 404)
             
         finally:
