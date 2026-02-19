@@ -402,11 +402,59 @@ class Handler(BaseHTTPRequestHandler):
         if not check_rate_limit(ip):
             return self._send_json({'error': 'Trop de requêtes'}, 429)
         
-        body = self._get_body()
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         
         try:
+            # Route: Webhook (lit self.rfile directement, pas de _get_body)
+            if self.path == '/webhook':
+                if not STRIPE_WEBHOOK_SECRET:
+                    logging.error("STRIPE_WEBHOOK_SECRET not configured")
+                    return self._send_json({'error': 'Webhook not configured'}, 500)
+
+                length = int(self.headers.get('Content-Length', 0))
+                if length == 0:
+                    return self._send_json({'error': 'No payload'}, 400)
+
+                payload = self.rfile.read(length)
+                sig_header = self.headers.get('Stripe-Signature')
+
+                if not sig_header:
+                    logging.warning(f"Webhook without signature from {ip}")
+                    return self._send_json({'error': 'Missing signature'}, 400)
+
+                try:
+                    event = stripe.Webhook.construct_event(
+                        payload, sig_header, STRIPE_WEBHOOK_SECRET
+                    )
+                except stripe.error.SignatureVerificationError:
+                    logging.warning(f"Invalid Stripe signature from {ip}")
+                    return self._send_json({'error': 'Invalid signature'}, 400)
+                except Exception as e:
+                    logging.error(f"Webhook parse error: {e}")
+                    return self._send_json({'error': 'Invalid payload'}, 400)
+
+                obj = event['data']['object']
+                event_type = event['type']
+                logging.info(f"Stripe event received: {event_type}")
+
+                if event_type == 'checkout.session.completed':
+                    email = (obj.get('customer_details') or {}).get('email') or obj.get('customer_email')
+                    if email:
+                        c.execute(
+                            'UPDATE users SET subscription_status = ? WHERE email = ?',
+                            ('active', email)
+                        )
+                        conn.commit()
+                        logging.info(f"Payment completed for {email}")
+                    else:
+                        logging.warning(f"checkout.session.completed: no email in event {event['id']}")
+
+                return self._send_json({'received': True})
+            
+            # Toutes les autres routes utilisent _get_body()
+            body = self._get_body()
+            
             # Route: Register
             if self.path == '/register':
                 email = sanitize_email(body.get('email', ''))
@@ -556,97 +604,13 @@ class Handler(BaseHTTPRequestHandler):
                     logging.error(f"Decode error: {e}")
                     return self._send_json({'error': 'Internal error'}, 500)
             
-            # Route: Webhook Stripe
-            elif self.path == '/webhook':
-                if not STRIPE_WEBHOOK_SECRET:
-                    logging.error("STRIPE_WEBHOOK_SECRET not configured")
-                    return self._send_json({'error': 'Webhook not configured'}, 500)
-
-                length = int(self.headers.get('Content-Length', 0))
-                if length == 0:
-                    return self._send_json({'error': 'No payload'}, 400)
-
-                # Payload raw bytes obligatoire — ne pas passer par _get_body()
-                payload = self.rfile.read(length)
-                sig_header = self.headers.get('Stripe-Signature')
-
-                if not sig_header:
-                    logging.warning(f"Webhook call without Stripe-Signature from {ip}")
-                    return self._send_json({'error': 'Missing signature'}, 400)
-
-                try:
-                    event = stripe.Webhook.construct_event(
-                        payload, sig_header, STRIPE_WEBHOOK_SECRET
-                    )
-                except stripe.error.SignatureVerificationError:
-                    logging.warning(f"Invalid Stripe signature from {ip}")
-                    return self._send_json({'error': 'Invalid signature'}, 400)
-                except Exception as e:
-                    logging.error(f"Webhook parse error: {e}")
-                    return self._send_json({'error': 'Invalid payload'}, 400)
-
-                obj = event['data']['object']
-                event_type = event['type']
-                logging.info(f"Stripe event received: {event_type}")
-
-                if event_type == 'checkout.session.completed':
-                    # Récupérer l'email via metadata (le plus fiable) ou customer_email
-                    email = (obj.get('metadata') or {}).get('user_email') or obj.get('customer_email')
-                    if email:
-                        c.execute(
-                            '''UPDATE users SET
-                                stripe_customer_id = ?,
-                                stripe_subscription_id = ?,
-                                subscription_status = 'active',
-                                subscription_ends_at = NULL
-                               WHERE email = ?''',
-                            (obj.get('customer'), obj.get('subscription'), email)
-                        )
-                        conn.commit()
-                        logging.info(f"Subscription activated for {email}")
-                    else:
-                        logging.warning(f"checkout.session.completed: no email found in event {event['id']}")
-
-                elif event_type == 'customer.subscription.deleted':
-                    # Abonnement résilié — on identifie l'user par son subscription_id
-                    c.execute(
-                        '''UPDATE users SET
-                            subscription_status = 'inactive',
-                            subscription_ends_at = ?
-                           WHERE stripe_subscription_id = ?''',
-                        (datetime.utcnow(), obj.get('id'))
-                    )
-                    conn.commit()
-                    logging.info(f"Subscription deleted: {obj.get('id')}")
-
-                elif event_type == 'customer.subscription.updated':
-                    # Changement de statut (ex: trial → active, active → past_due)
-                    stripe_status = obj.get('status')  # 'active', 'past_due', 'canceled', etc.
-                    # On mappe les statuts Stripe vers nos statuts internes
-                    internal_status = 'active' if stripe_status == 'active' else 'inactive'
-                    c.execute(
-                        'UPDATE users SET subscription_status = ? WHERE stripe_subscription_id = ?',
-                        (internal_status, obj.get('id'))
-                    )
-                    conn.commit()
-                    logging.info(f"Subscription updated: {obj.get('id')} → {internal_status}")
-
-                elif event_type == 'invoice.payment_failed':
-                    # Paiement échoué — on passe en past_due sans couper l'accès immédiatement
-                    c.execute(
-                        'UPDATE users SET subscription_status = ? WHERE stripe_customer_id = ?',
-                        ('past_due', obj.get('customer'))
-                    )
-                    conn.commit()
-                    logging.warning(f"Payment failed for customer: {obj.get('customer')}")
-
-                # Stripe exige un 200 rapide — toujours répondre même pour les events non gérés
-                return self._send_json({'received': True})
-
+            
             return self._send_json({'error': 'Route non trouvée'}, 404)
             
         finally:
             conn.close()
+    
+    
     
     def do_GET(self):
         ip = self._get_ip()
@@ -707,11 +671,11 @@ if __name__ == '__main__':
     if SECRET_KEY == secrets.token_urlsafe(32):
         logging.warning("WARNING: Using generated SECRET_KEY - set SECRET_KEY env var for production!")
     
-    logging.info(f"Server starting on http://0.0.0.0:{PORT}")
+    logging.info(f"Server starting on http://127.0.0.1:{PORT}")
     logging.info(f"Database: {DB_PATH}")
     logging.info("Using: email-validator + bleach for input sanitization")
     
-    server = HTTPServer(('0.0.0.0', PORT), Handler)
+    server = HTTPServer(('localhost', PORT), Handler)
     
     try:
         server.serve_forever()

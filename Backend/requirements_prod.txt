@@ -4,3 +4,4 @@ bleach==6.1.0
 python-dotenv==1.0.0
 pycryptodome==3.19.0
 google-cloud-secret-manager==2.16.4
+stripe==14.3.0
