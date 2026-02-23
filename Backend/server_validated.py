@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-
+"""
+Serveur d'authentification avec bibliothèques de validation
+"""
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import json
 import jwt
@@ -19,7 +21,7 @@ from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
 import binascii
 import ipaddress
-import stripe
+import requests
 
 # Charger le fichier .env
 load_dotenv()
@@ -45,6 +47,7 @@ logging.basicConfig(
 # Config
 SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_urlsafe(32))
 PORT = int(os.getenv("PORT", "8000"))
+URL = os.getenv("URL", "localhost")
 DB_PATH = os.getenv("DB_PATH", "auth.db")
 
 # SMTP Config
@@ -57,9 +60,9 @@ SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 AES_KEY = os.getenv("AES_KEY", "")  # 64 caractères hex (32 bytes)
 AES_IV = os.getenv("AES_IV", "")    # 32 caractères hex (16 bytes)
 
-# Stripe Config
-stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
-STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
+# Gumroad Config
+GUMROAD_WEBHOOK_SECRET = os.getenv("GUMROAD_WEBHOOK_SECRET")  # Secret path token
+GUMROAD_ACCESS_TOKEN = os.getenv("GUMROAD_ACCESS_TOKEN")      # Pour vérifier les sales
 
 
 # Format: liste d'IPs séparées par des virgules dans TRUSTED_PROXIES
@@ -111,6 +114,12 @@ def init_db():
         ip TEXT,
         email TEXT,
         timestamp TIMESTAMP
+    )''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS processed_sales (
+        sale_id TEXT PRIMARY KEY,
+        email TEXT,
+        processed_at TIMESTAMP
     )''')
     
     conn.commit()
@@ -406,51 +415,96 @@ class Handler(BaseHTTPRequestHandler):
         c = conn.cursor()
         
         try:
-            # Route: Webhook (lit self.rfile directement, pas de _get_body)
-            if self.path == '/webhook':
-                if not STRIPE_WEBHOOK_SECRET:
-                    logging.error("STRIPE_WEBHOOK_SECRET not configured")
-                    return self._send_json({'error': 'Webhook not configured'}, 500)
+            # Route: Webhook Gumroad (lit self.rfile directement, pas de _get_body)
+            if self.path.startswith('/webhook/'):
+                # Vérifier le secret dans le path
+                path_parts = self.path.split('/')
+                if len(path_parts) < 3:
+                    logging.warning(f"Gumroad webhook: invalid path from {ip}")
+                    return self._send_json({'error': 'Invalid webhook URL'}, 404)
+                
+                secret = path_parts[2]
+                
+                if not GUMROAD_WEBHOOK_SECRET or secret != GUMROAD_WEBHOOK_SECRET:
+                    logging.warning(f"Gumroad webhook: invalid secret from {ip}")
+                    return self._send_json({'error': 'Unauthorized'}, 401)
 
+                # Lire le body (form data)
                 length = int(self.headers.get('Content-Length', 0))
                 if length == 0:
                     return self._send_json({'error': 'No payload'}, 400)
 
-                payload = self.rfile.read(length)
-                sig_header = self.headers.get('Stripe-Signature')
-
-                if not sig_header:
-                    logging.warning(f"Webhook without signature from {ip}")
-                    return self._send_json({'error': 'Missing signature'}, 400)
-
+                body_bytes = self.rfile.read(length)
+                body_str = body_bytes.decode('utf-8')
+                
+                # Parser form data (application/x-www-form-urlencoded)
+                from urllib.parse import parse_qs
+                form_data = parse_qs(body_str)
+                
+                # Gumroad envoie sale_id, email, etc.
+                sale_id = form_data.get('sale_id', [None])[0]
+                email = form_data.get('email', [None])[0]
+                
+                if not sale_id:
+                    logging.warning(f"Gumroad webhook: missing sale_id from {ip}")
+                    return self._send_json({'error': 'Missing sale_id'}, 400)
+                
+                # Vérifier si déjà traité (replay attack)
+                c.execute('SELECT sale_id FROM processed_sales WHERE sale_id = ?', (sale_id,))
+                if c.fetchone():
+                    logging.warning(f"Gumroad webhook: duplicate sale_id {sale_id} from {ip}")
+                    return self._send_json({'error': 'Already processed'}, 400)
+                
+                # Vérifier avec l'API Gumroad
+                if not GUMROAD_ACCESS_TOKEN:
+                    logging.error("GUMROAD_ACCESS_TOKEN not configured")
+                    return self._send_json({'error': 'Server misconfiguration'}, 500)
+                
                 try:
-                    event = stripe.Webhook.construct_event(
-                        payload, sig_header, STRIPE_WEBHOOK_SECRET
+                    verify_response = requests.get(
+                        f'https://api.gumroad.com/v2/sales/{sale_id}',
+                        params={'access_token': GUMROAD_ACCESS_TOKEN},
+                        timeout=10
                     )
-                except stripe.error.SignatureVerificationError:
-                    logging.warning(f"Invalid Stripe signature from {ip}")
-                    return self._send_json({'error': 'Invalid signature'}, 400)
-                except Exception as e:
-                    logging.error(f"Webhook parse error: {e}")
-                    return self._send_json({'error': 'Invalid payload'}, 400)
-
-                obj = event['data']['object']
-                event_type = event['type']
-                logging.info(f"Stripe event received: {event_type}")
-
-                if event_type == 'checkout.session.completed':
-                    email = (obj.get('customer_details') or {}).get('email') or obj.get('customer_email')
-                    if email:
-                        c.execute(
-                            'UPDATE users SET subscription_status = ? WHERE email = ?',
-                            ('active', email)
-                        )
-                        conn.commit()
-                        logging.info(f"Payment completed for {email}")
-                    else:
-                        logging.warning(f"checkout.session.completed: no email in event {event['id']}")
-
-                return self._send_json({'received': True})
+                    
+                    if verify_response.status_code != 200:
+                        logging.warning(f"Gumroad API verification failed for {sale_id}: {verify_response.status_code}")
+                        return self._send_json({'error': 'Sale verification failed'}, 400)
+                    
+                    sale_data = verify_response.json()
+                    
+                    # Vérifier que la sale est valide
+                    if not sale_data.get('success'):
+                        logging.warning(f"Gumroad sale {sale_id} not valid")
+                        return self._send_json({'error': 'Invalid sale'}, 400)
+                    
+                    # Récupérer l'email de la sale (plus fiable que celui du webhook)
+                    verified_email = sale_data.get('sale', {}).get('email') or email
+                    
+                    if not verified_email:
+                        logging.warning(f"No email in Gumroad sale {sale_id}")
+                        return self._send_json({'error': 'No email found'}, 400)
+                    
+                    # Activer l'accès pour cet utilisateur
+                    c.execute(
+                        'UPDATE users SET subscription_status = ? WHERE email = ?',
+                        ('active', verified_email)
+                    )
+                    
+                    # Enregistrer la sale comme traitée
+                    c.execute(
+                        'INSERT INTO processed_sales (sale_id, email, processed_at) VALUES (?, ?, ?)',
+                        (sale_id, verified_email, datetime.utcnow())
+                    )
+                    
+                    conn.commit()
+                    logging.info(f"Gumroad payment processed: {sale_id} for {verified_email}")
+                    
+                    return self._send_json({'success': True})
+                    
+                except requests.RequestException as e:
+                    logging.error(f"Gumroad API error: {e}")
+                    return self._send_json({'error': 'API communication failed'}, 500)
             
             # Toutes les autres routes utilisent _get_body()
             body = self._get_body()
@@ -610,8 +664,6 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             conn.close()
     
-    
-    
     def do_GET(self):
         ip = self._get_ip()
         
@@ -667,15 +719,14 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == '__main__':
     init_db()
-    
     if SECRET_KEY == secrets.token_urlsafe(32):
         logging.warning("WARNING: Using generated SECRET_KEY - set SECRET_KEY env var for production!")
     
-    logging.info(f"Server starting on http://127.0.0.1:{PORT}")
+    logging.info(f"Server starting on http://{URL}:{PORT}")
     logging.info(f"Database: {DB_PATH}")
     logging.info("Using: email-validator + bleach for input sanitization")
     
-    server = HTTPServer(('localhost', PORT), Handler)
+    server = HTTPServer((URL, PORT), Handler)
     
     try:
         server.serve_forever()
