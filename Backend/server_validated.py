@@ -1,39 +1,63 @@
 #!/usr/bin/env python3
 """
-Serveur d'authentification avec bibliothèques de validation
+Serveur d'authentification — Flask
 """
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import json
-import jwt
-import secrets
-from datetime import datetime, timedelta
 import os
+import json
+import secrets
+import logging
+import sqlite3
 import smtplib
+import binascii
+import ipaddress
+from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-import sqlite3
-import logging
-import bleach
+from functools import wraps
+
+import jwt
+import requests
+from flask import Flask, request, jsonify, g
 from email_validator import validate_email, EmailNotValidError
-import html
 from dotenv import load_dotenv
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
-import binascii
-import ipaddress
-import requests
 
-# Charger le fichier .env
+# ─── Config ──────────────────────────────────────────────────────────────────
+
 load_dotenv()
 
-# Logging
-import sys
+SECRET_KEY = os.getenv("SECRET_KEY")
+if not SECRET_KEY:
+    logging.warning("SECRET_KEY not set — using generated key, not suitable for production!")
+    SECRET_KEY = secrets.token_urlsafe(32)
 
-# Fix Windows encoding
-if sys.platform == 'win32':
-    import io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+PORT     = int(os.getenv("PORT", "8000"))
+HOST     = os.getenv("HOST", "localhost")
+DB_PATH  = os.getenv("DB_PATH", "auth.db")
+
+ALLOWED_ORIGIN = os.getenv("ALLOWED_ORIGIN")
+
+SMTP_HOST     = os.getenv("SMTP_HOST")
+SMTP_PORT     = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER     = os.getenv("SMTP_USER")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
+
+AES_KEY = os.getenv("AES_KEY", "")
+AES_IV  = os.getenv("AES_IV", "")
+
+GUMROAD_WEBHOOK_SECRET = os.getenv("GUMROAD_WEBHOOK_SECRET")
+GUMROAD_ACCESS_TOKEN   = os.getenv("GUMROAD_ACCESS_TOKEN")
+
+TRUSTED_PROXIES = {
+    ip.strip()
+    for ip in os.getenv("TRUSTED_PROXIES", "").split(",")
+    if ip.strip()
+}
+
+FREE_TIER_LIMIT = 3
+
+# ─── Logging ─────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,691 +68,408 @@ logging.basicConfig(
     ]
 )
 
-# Config
-SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_urlsafe(32))
-PORT = int(os.getenv("PORT", "8000"))
-URL = os.getenv("URL", "localhost")
-DB_PATH = os.getenv("DB_PATH", "auth.db")
+app = Flask(__name__)
 
-# SMTP Config
-SMTP_HOST = os.getenv("SMTP_HOST")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
+# ─── Database ────────────────────────────────────────────────────────────────
 
-# AES Config
-AES_KEY = os.getenv("AES_KEY", "")  # 64 caractères hex (32 bytes)
-AES_IV = os.getenv("AES_IV", "")    # 32 caractères hex (16 bytes)
+def get_db():
+    if 'db' not in g:
+        g.db = sqlite3.connect(DB_PATH)
+        g.db.row_factory = sqlite3.Row
+    return g.db
 
-# Gumroad Config
-GUMROAD_WEBHOOK_SECRET = os.getenv("GUMROAD_WEBHOOK_SECRET")  # Secret path token
-GUMROAD_ACCESS_TOKEN = os.getenv("GUMROAD_ACCESS_TOKEN")      # Pour vérifier les sales
-
-
-# Format: liste d'IPs séparées par des virgules dans TRUSTED_PROXIES
-TRUSTED_PROXIES = set(
-    ip.strip()
-    for ip in os.getenv("TRUSTED_PROXIES", "").split(",")
-    if ip.strip()
-)
-
-rate_limits = {}
+@app.teardown_appcontext
+def close_db(_):
+    db = g.pop('db', None)
+    if db:
+        db.close()
 
 def init_db():
-    """Initialise la base de données SQLite"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    
-    c.execute('''CREATE TABLE IF NOT EXISTS users (
-        email TEXT PRIMARY KEY,
-        created_at TIMESTAMP,
-        last_login TIMESTAMP,
-        stripe_customer_id TEXT,
-        stripe_subscription_id TEXT,
-        subscription_status TEXT DEFAULT 'inactive',
-        subscription_ends_at TIMESTAMP,
-        decode_attempts INTEGER DEFAULT 0
-    )''')
-    
-    # Migrations pour les bases existantes
-    for column, definition in [
-        ('stripe_customer_id',      'TEXT'),
-        ('stripe_subscription_id',  'TEXT'),
-        ('subscription_status',     "TEXT DEFAULT 'inactive'"),
-        ('subscription_ends_at',    'TIMESTAMP'),
-        ('decode_attempts',         'INTEGER DEFAULT 0'),
-    ]:
-        try:
-            c.execute(f'ALTER TABLE users ADD COLUMN {column} {definition}')
-        except sqlite3.OperationalError:
-            pass  # Colonne déjà existante
-    
-    c.execute('''CREATE TABLE IF NOT EXISTS codes (
-        email TEXT PRIMARY KEY,
-        code TEXT,
-        expires_at TIMESTAMP,
-        attempts INTEGER
-    )''')
-    
-    c.execute('''CREATE TABLE IF NOT EXISTS failed_attempts (
-        ip TEXT,
-        email TEXT,
-        timestamp TIMESTAMP
-    )''')
-    
-    c.execute('''CREATE TABLE IF NOT EXISTS processed_sales (
-        sale_id TEXT PRIMARY KEY,
-        email TEXT,
-        processed_at TIMESTAMP
-    )''')
-    
-    conn.commit()
-    conn.close()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.executescript('''
+            CREATE TABLE IF NOT EXISTS users (
+                email                TEXT PRIMARY KEY,
+                created_at           TIMESTAMP,
+                last_login           TIMESTAMP,
+                subscription_status  TEXT DEFAULT 'inactive',
+                subscription_ends_at TIMESTAMP,
+                decode_attempts      INTEGER DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS codes (
+                email      TEXT PRIMARY KEY,
+                code       TEXT,
+                expires_at TIMESTAMP,
+                attempts   INTEGER DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS failed_attempts (
+                ip        TEXT,
+                email     TEXT,
+                timestamp TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS processed_sales (
+                sale_id      TEXT PRIMARY KEY,
+                email        TEXT,
+                processed_at TIMESTAMP
+            );
+        ''')
+        for col, definition in [
+            ('subscription_status',  "TEXT DEFAULT 'inactive'"),
+            ('subscription_ends_at', 'TIMESTAMP'),
+            ('decode_attempts',      'INTEGER DEFAULT 0'),
+        ]:
+            try:
+                conn.execute(f'ALTER TABLE users ADD COLUMN {col} {definition}')
+            except sqlite3.OperationalError:
+                pass
 
-def sanitize_email(email_input):
-    # Vérification de type stricte — rejette int, list, dict, etc.
-    if not isinstance(email_input, str):
-        logging.warning(f"Invalid email type: {type(email_input)}")
+# ─── Sanitizers ──────────────────────────────────────────────────────────────
+
+def sanitize_email(value):
+    if not isinstance(value, str) or len(value) > 254:
         return None
-
-    # Limite RFC 5321 : 254 chars max — coupe court avant email-validator
-    if len(email_input) > 254:
-        logging.warning("Email input exceeds RFC max length (254)")
-        return None
-
     try:
-        emailinfo = validate_email(email_input, check_deliverability=False)
-        # email-validator retourne déjà un email normalisé et sûr
-        return emailinfo.normalized
-
-    except EmailNotValidError as e:
-        logging.warning(f"Invalid email attempt: {email_input} - {str(e)}")
+        return validate_email(value, check_deliverability=False).normalized
+    except EmailNotValidError:
         return None
 
-def sanitize_code(code_input):
-    """Validation code de vérification — doit être exactement 6 chiffres"""
-    # Vérification de type stricte
-    if not isinstance(code_input, str):
+def sanitize_code(value):
+    if not isinstance(value, str):
         return None
+    v = value.strip()
+    return v if v.isdigit() and len(v) == 6 else None
 
-    stripped = code_input.strip()
-
-    # Doit être exactement 6 chiffres — isdigit() suffit, bleach n'apporte rien ici
-    if not stripped.isdigit() or len(stripped) != 6:
-        return None
-
-    return stripped
-
-def sanitize_ip(ip_input):
-    """Validation IP — vérifie le format réel avec ipaddress (IPv4 et IPv6)"""
-    if not isinstance(ip_input, str):
+def sanitize_ip(value):
+    if not isinstance(value, str):
         return "unknown"
-
-    stripped = ip_input.strip()
-
     try:
-        # ipaddress.ip_address() lève ValueError si ce n'est pas une IP valide
-        ipaddress.ip_address(stripped)
-        return stripped
+        ipaddress.ip_address(value.strip())
+        return value.strip()
     except ValueError:
-        logging.warning(f"Invalid IP format: {stripped!r}")
         return "unknown"
 
-def hex_to_bytes(hex_string):
-    """Convertit hexadécimal en bytes"""
-    return binascii.unhexlify(hex_string)
+# ─── Rate limiting ───────────────────────────────────────────────────────────
 
-def decrypt_aes_cbc(encrypted_data, key_hex, iv_hex):
-    """
-    Déchiffre les données avec AES-CBC
-    
-    Args:
-        encrypted_data: bytes chiffrés
-        key_hex: clé en hexadécimal (64 chars pour AES-256)
-        iv_hex: IV en hexadécimal (32 chars)
-    
-    Returns:
-        dict: JSON déchiffré ou None si erreur
-    """
+_rate_limits: dict = {}
+
+def check_rate_limit(ip: str) -> bool:
+    now = datetime.utcnow()
+    for k in [k for k, v in _rate_limits.items() if now > v['reset']]:
+        del _rate_limits[k]
+
+    entry = _rate_limits.get(ip)
+    if not entry or now > entry['reset']:
+        _rate_limits[ip] = {'count': 1, 'reset': now + timedelta(minutes=1)}
+        return True
+    if entry['count'] >= 10:
+        return False
+    entry['count'] += 1
+    return True
+
+def get_client_ip():
+    direct = request.remote_addr
+    if direct in TRUSTED_PROXIES:
+        forwarded = request.headers.get('X-Forwarded-For')
+        if forwarded:
+            return sanitize_ip(forwarded.split(',')[0].strip())
+    return sanitize_ip(direct)
+
+def rate_limited(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if not check_rate_limit(get_client_ip()):
+            return jsonify(error='Trop de requêtes'), 429
+        return f(*args, **kwargs)
+    return wrapper
+
+# ─── Auth ────────────────────────────────────────────────────────────────────
+
+def create_token(email: str) -> str:
+    return jwt.encode({
+        "sub": email,
+        "iat": datetime.utcnow(),
+        "exp": datetime.utcnow() + timedelta(days=7),
+        "jti": secrets.token_urlsafe(16),
+    }, SECRET_KEY, algorithm="HS256")
+
+def verify_token(token: str):
     try:
-        key = hex_to_bytes(key_hex)
-        iv = hex_to_bytes(iv_hex)
-        
-        cipher = AES.new(key, AES.MODE_CBC, iv)
-        decrypted = cipher.decrypt(encrypted_data)
-        unpadded = unpad(decrypted, AES.block_size)
-        text = unpadded.decode('utf-8')
-        
-        return json.loads(text)
-        
+        return jwt.decode(token, SECRET_KEY, algorithms=["HS256"]).get("sub")
+    except jwt.InvalidTokenError:
+        return None
+
+def require_auth(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        auth = request.headers.get('Authorization', '')
+        if not auth.startswith('Bearer '):
+            return jsonify(error='Non authentifié'), 401
+        email = verify_token(auth[7:])
+        if not email:
+            return jsonify(error='Token invalide'), 401
+        g.email = email
+        return f(*args, **kwargs)
+    return wrapper
+
+# ─── CORS & security headers ─────────────────────────────────────────────────
+
+@app.after_request
+def add_headers(resp):
+    origin = ALLOWED_ORIGIN or request.headers.get('Origin', '')
+    logging.info(f"Request from {origin} to {request.path}")
+    resp.headers['Access-Control-Allow-Origin']  = origin
+    resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+    resp.headers['X-Content-Type-Options']       = 'nosniff'
+    resp.headers['X-Frame-Options']              = 'DENY'
+    resp.headers['Content-Security-Policy']      = "default-src 'none'"
+    return resp
+
+@app.route('/', defaults={'path': ''}, methods=['OPTIONS'])
+@app.route('/<path:path>', methods=['OPTIONS'])
+def options(_=None, **__):
+    return '', 200
+
+# ─── Email ───────────────────────────────────────────────────────────────────
+
+def send_email(email: str, code: str):
+    if not all([SMTP_HOST, SMTP_USER, SMTP_PASSWORD]):
+        print(f"\n{'='*50}\nCODE pour {email}: {code}\n{'='*50}\n")
+        return
+
+    msg = MIMEMultipart('alternative')
+    msg['Subject'] = 'Code de vérification'
+    msg['From']    = SMTP_USER
+    msg['To']      = email
+    msg.attach(MIMEText(f"Votre code : {code}\n\nExpire dans 10 minutes.", 'plain'))
+    msg.attach(MIMEText(f"""
+        <html><body>
+            <h2>Code de vérification</h2>
+            <p>Votre code : <strong style="font-size:24px;color:#2563eb">{code}</strong></p>
+            <p>Expire dans 10 minutes.</p>
+        </body></html>
+    """, 'html'))
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASSWORD)
+        server.send_message(msg)
+
+    logging.info(f"Email sent to {email}")
+
+
+# ─── Crypto ──────────────────────────────────────────────────────────────────
+
+def decrypt_aes_cbc(data: bytes):
+    try:
+        cipher = AES.new(binascii.unhexlify(AES_KEY), AES.MODE_CBC, binascii.unhexlify(AES_IV))
+        return json.loads(unpad(cipher.decrypt(data), AES.block_size).decode('utf-8'))
     except Exception as e:
         logging.error(f"Decryption error: {e}")
         return None
 
-def check_rate_limit(ip):
-    """Max 10 requests/minute per IP"""
-    now = datetime.utcnow()
-    
-    if ip not in rate_limits:
-        rate_limits[ip] = {'count': 1, 'reset': now + timedelta(minutes=1)}
-        return True
-    
-    data = rate_limits[ip]
-    
-    if now > data['reset']:
-        data['count'] = 1
-        data['reset'] = now + timedelta(minutes=1)
-        return True
-    
-    if data['count'] >= 10:
-        logging.warning(f"Rate limit exceeded for IP: {ip}")
-        return False
-    
-    data['count'] += 1
-    return True
+# ─── Routes ──────────────────────────────────────────────────────────────────
 
-def generate_code():
-    """Code à 6 chiffres cryptographiquement sûr"""
-    return str(secrets.randbelow(1000000)).zfill(6)
+@app.get('/')
+def index():
+    return jsonify(status='running', endpoints={
+        'POST /register':    'Envoyer un code',
+        'POST /verify':      'Vérifier le code',
+        'GET  /me':          'Info utilisateur (auth requise)',
+        'POST /decode':      'Déchiffrer des données (auth requise)',
+        'POST /webhook/<s>': 'Webhook Gumroad',
+    })
 
-def send_email(email, code):
-    """
-    Envoie email via SMTP
-    
-    Configuration requise en variables d'environnement:
-    - SMTP_HOST (ex: smtp.gmail.com)
-    - SMTP_PORT (ex: 587)
-    - SMTP_USER (votre email)
-    - SMTP_PASSWORD (mot de passe ou app password)
-    """
-    smtp_host = os.getenv('SMTP_HOST')
-    smtp_port = int(os.getenv('SMTP_PORT', '587'))
-    smtp_user = os.getenv('SMTP_USER')
-    smtp_password = os.getenv('SMTP_PASSWORD')
-    
-    # Mode dev - affiche le code
-    if not smtp_host or not smtp_user or not smtp_password:
-        logging.warning(f"SMTP not configured - displaying code for {email}")
-        print(f"\n{'='*50}")
-        print(f"CODE pour {email}: {code}")
-        print(f"{'='*50}\n")
-        return
-    
+
+@app.post('/register')
+@rate_limited
+def register():
+    email = sanitize_email((request.json or {}).get('email', ''))
+    if not email:
+        return jsonify(error='Email invalide'), 400
+
+    code = str(secrets.randbelow(1_000_000)).zfill(6)
+    db   = get_db()
+    db.execute('INSERT OR IGNORE INTO users (email, created_at) VALUES (?, ?)', (email, datetime.utcnow()))
+    db.execute(
+        'INSERT OR REPLACE INTO codes (email, code, expires_at, attempts) VALUES (?, ?, ?, 0)',
+        (email, code, datetime.utcnow() + timedelta(minutes=10))
+    )
+    db.commit()
+
     try:
-        # Création du message
-        msg = MIMEMultipart('alternative')
-        msg['Subject'] = 'Code de verification'
-        msg['From'] = smtp_user
-        msg['To'] = email
-        
-        # Version texte
-        text = f"""
-            Votre code de verification: {code}
-
-            Ce code expire dans 10 minutes.
-
-            Si vous n'avez pas demande ce code, ignorez cet email.
-            """
-        
-        # Version HTML
-        html_content = f"""
-            <html>
-            <body>
-                <h2>Code de verification</h2>
-                <p>Votre code de verification: <strong style="font-size: 24px; color: #2563eb;">{code}</strong></p>
-                <p>Ce code expire dans 10 minutes.</p>
-                <hr>
-                <p style="color: #666; font-size: 12px;">Si vous n'avez pas demande ce code, ignorez cet email.</p>
-            </body>
-            </html>
-            """
-        
-        # Attacher les deux versions
-        part1 = MIMEText(text, 'plain')
-        part2 = MIMEText(html_content, 'html')
-        msg.attach(part1)
-        msg.attach(part2)
-        
-        # Connexion SMTP
-        with smtplib.SMTP(smtp_host, smtp_port) as server:
-            server.starttls()  # Chiffrement TLS
-            server.login(smtp_user, smtp_password)
-            server.send_message(msg)
-        
-        logging.info(f"Email sent to {email}")
-        
-    except smtplib.SMTPAuthenticationError:
-        logging.error("SMTP Authentication failed - check credentials")
-        raise Exception("Erreur authentification SMTP")
-    except smtplib.SMTPException as e:
-        logging.error(f"SMTP error: {e}")
-        raise Exception("Erreur envoi email")
+        send_email(email, code)
     except Exception as e:
-        logging.error(f"Unexpected error: {e}")
-        raise Exception("Erreur envoi email")
+        logging.error(f"Email error: {e}")
+        return jsonify(error='Erreur envoi email'), 500
 
-def create_token(email):
-    """JWT avec expiration"""
-    payload = {
-        "sub": email,
-        "iat": datetime.utcnow(),
-        "exp": datetime.utcnow() + timedelta(days=7),
-        "jti": secrets.token_urlsafe(16)
-    }
-    return jwt.encode(payload, SECRET_KEY, algorithm="HS256")
+    logging.info(f"Code sent to {email} from {get_client_ip()}")
+    return jsonify(message='Code envoyé')
 
-def verify_token(token):
-    """Vérifie et décode le token"""
+
+@app.post('/verify')
+@rate_limited
+def verify():
+    body  = request.json or {}
+    email = sanitize_email(body.get('email', ''))
+    code  = sanitize_code(body.get('code', ''))
+    ip    = get_client_ip()
+
+    if not email or not code:
+        return jsonify(error='Données invalides'), 400
+
+    db  = get_db()
+    row = db.execute('SELECT code, expires_at, attempts FROM codes WHERE email = ?', (email,)).fetchone()
+
+    if not row:
+        db.execute('INSERT INTO failed_attempts VALUES (?, ?, ?)', (ip, email, datetime.utcnow()))
+        db.commit()
+        return jsonify(error='Aucun code pour cet email'), 400
+
+    if datetime.utcnow() > datetime.fromisoformat(row['expires_at']):
+        db.execute('DELETE FROM codes WHERE email = ?', (email,))
+        db.commit()
+        return jsonify(error='Code expiré'), 400
+
+    if row['attempts'] >= 5:
+        db.execute('DELETE FROM codes WHERE email = ?', (email,))
+        db.commit()
+        return jsonify(error='Trop de tentatives'), 400
+
+    if row['code'] != code:
+        db.execute('UPDATE codes SET attempts = attempts + 1 WHERE email = ?', (email,))
+        db.execute('INSERT INTO failed_attempts VALUES (?, ?, ?)', (ip, email, datetime.utcnow()))
+        db.commit()
+        return jsonify(error='Code incorrect'), 400
+
+    db.execute('UPDATE users SET last_login = ? WHERE email = ?', (datetime.utcnow(), email))
+    db.execute('DELETE FROM codes WHERE email = ?', (email,))
+    db.commit()
+
+    logging.info(f"User {email} verified from {ip}")
+    return jsonify(token=create_token(email))
+
+
+@app.get('/me')
+@rate_limited
+@require_auth
+def me():
+    db  = get_db()
+    row = db.execute(
+        'SELECT created_at, last_login, subscription_status FROM users WHERE email = ?',
+        (g.email,)
+    ).fetchone()
+
+    if not row:
+        return jsonify(error='Utilisateur non trouvé'), 404
+
+    db.execute('UPDATE users SET last_login = ? WHERE email = ?', (datetime.utcnow(), g.email))
+    db.commit()
+
+    return jsonify(
+        email=g.email,
+        created_at=row['created_at'],
+        last_login=row['last_login'],
+        subscription_status=row['subscription_status'],
+    )
+
+
+@app.post('/decode')
+@rate_limited
+#@require_auth
+def decode():
+    if not AES_KEY or not AES_IV:
+        return jsonify(error='AES not configured'), 500
+
+    """db  = get_db()
+    row = db.execute(
+        'SELECT decode_attempts, subscription_status, subscription_ends_at FROM users WHERE email = ?',
+        (g.email,)
+    ).fetchone()
+
+    if not row:
+        return jsonify(error='Utilisateur non trouvé'), 404
+
+    attempts = row['decode_attempts']
+
+    if attempts >= FREE_TIER_LIMIT:
+        active = row['subscription_status'] == 'active'
+        if active and row['subscription_ends_at']:
+            try:
+                active = datetime.fromisoformat(row['subscription_ends_at']) >= datetime.utcnow()
+            except (ValueError, TypeError):
+                active = False
+        if not active:
+            return jsonify(
+                error='subscription_required',
+                message=f'Limite gratuite atteinte ({FREE_TIER_LIMIT} déchiffrements).',
+                decode_attempts =0,#decode_attempts=attempts,
+                limit=FREE_TIER_LIMIT,
+            ), 402"""
+
+    data = request.get_data()
+    if not data:
+        return jsonify(error='No data provided'), 400
+
+    decrypted = decrypt_aes_cbc(data)
+    if decrypted is None:
+        return jsonify(error='Decryption failed'), 400
+    """db.execute('UPDATE users SET decode_attempts = decode_attempts + 1 WHERE email = ?', (g.email,))
+    db.commit()"""
+
+    attempts = 0 #row['decode_attempts']
+    #logging.info(f"Decrypted for {g.email} from {get_client_ip()} (attempt #{attempts + 1})")
+    return jsonify(success=True, data=decrypted, decode_attempts=attempts + 1, limit=FREE_TIER_LIMIT)
+
+@app.post('/webhook/<secret>')
+@rate_limited
+def webhook(secret):
+    if not GUMROAD_WEBHOOK_SECRET or secret != GUMROAD_WEBHOOK_SECRET:
+        logging.warning(f"Webhook: invalid secret from {get_client_ip()}")
+        return jsonify(error='Unauthorized'), 401
+
+    sale_id = request.form.get('sale_id')
+    email   = request.form.get('email')
+
+    if not sale_id:
+        return jsonify(error='Missing sale_id'), 400
+
+    db = get_db()
+    if db.execute('SELECT 1 FROM processed_sales WHERE sale_id = ?', (sale_id,)).fetchone():
+        return jsonify(error='Already processed'), 400
+
+    if not GUMROAD_ACCESS_TOKEN:
+        return jsonify(error='Server misconfiguration'), 500
+
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
-        return payload.get("sub")
-    except jwt.ExpiredSignatureError:
-        logging.warning("Expired token used")
-        return None
-    except jwt.JWTError as e:
-        logging.warning(f"Invalid token: {e}")
-        return None
-
-class Handler(BaseHTTPRequestHandler):
-    
-    def _send_json(self, data, status=200):
-        self.send_response(status)
-        self.send_header('Content-Type', 'application/json')
-        
-        # Security headers
-        self.send_header('X-Content-Type-Options', 'nosniff')
-        self.send_header('X-Frame-Options', 'DENY')
-        self.send_header('X-XSS-Protection', '1; mode=block')
-        self.send_header('Strict-Transport-Security', 'max-age=31536000; includeSubDomains')
-        self.send_header('Content-Security-Policy', "default-src 'none'")
-        
-        allowed_origin = os.getenv('ALLOWED_ORIGIN', '*')
-        self.send_header('Access-Control-Allow-Origin', allowed_origin)
-        
-        self.end_headers()
-        self.wfile.write(json.dumps(data).encode())
-    
-    def _get_body(self):
-        try:
-            length = int(self.headers.get('Content-Length', 0))
-            if length > 10000:  # Max 10KB
-                return {}
-
-            body_bytes = self.rfile.read(length) if length else b'{}'
-            body_str = body_bytes.decode('utf-8')
-
-            # Parse JSON directement — chaque champ est sanitisé individuellement ensuite
-            parsed = json.loads(body_str)
-
-            # On n'accepte que des objets JSON (dict), pas des arrays ou primitives
-            if not isinstance(parsed, dict):
-                logging.warning("JSON body is not an object")
-                return {}
-
-            return parsed
-        except Exception as e:
-            logging.warning(f"Invalid body: {e}")
-            return {}
-    
-    def _get_ip(self):
-        """
-        Récupère la vraie IP cliente.
-        X-Forwarded-For n'est accepté que si la requête vient d'un proxy de confiance
-        (défini dans TRUSTED_PROXIES), pour éviter le spoofing du rate limiting.
-        """
-        direct_ip = self.client_address[0]
-
-        if direct_ip in TRUSTED_PROXIES:
-            forwarded = self.headers.get('X-Forwarded-For')
-            if forwarded:
-                # Prendre la première IP de la chaîne (IP originale du client)
-                ip = forwarded.split(',')[0].strip()
-                return sanitize_ip(ip)
-
-        return sanitize_ip(direct_ip)
-    
-    def _log_failed_attempt(self, ip, email):
-        """Log failed attempts"""
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute(
-            'INSERT INTO failed_attempts (ip, email, timestamp) VALUES (?, ?, ?)',
-            (ip, email, datetime.utcnow())
+        resp = requests.get(
+            f'https://api.gumroad.com/v2/sales/{sale_id}',
+            params={'access_token': GUMROAD_ACCESS_TOKEN},
+            timeout=10,
         )
-        conn.commit()
-        conn.close()
-    
-    def do_OPTIONS(self):
-        self.send_response(200)
-        self.send_header('Access-Control-Allow-Origin', os.getenv('ALLOWED_ORIGIN', '*'))
-        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
-        self.end_headers()
-    
-    def do_POST(self):
-        ip = self._get_ip()
-        
-        if not check_rate_limit(ip):
-            return self._send_json({'error': 'Trop de requêtes'}, 429)
-        
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        
-        try:
-            # Route: Webhook Gumroad (lit self.rfile directement, pas de _get_body)
-            if self.path.startswith('/webhook/'):
-                # Vérifier le secret dans le path
-                path_parts = self.path.split('/')
-                if len(path_parts) < 3:
-                    logging.warning(f"Gumroad webhook: invalid path from {ip}")
-                    return self._send_json({'error': 'Invalid webhook URL'}, 404)
-                
-                secret = path_parts[2]
-                
-                if not GUMROAD_WEBHOOK_SECRET or secret != GUMROAD_WEBHOOK_SECRET:
-                    logging.warning(f"Gumroad webhook: invalid secret from {ip}")
-                    return self._send_json({'error': 'Unauthorized'}, 401)
+    except requests.RequestException as e:
+        logging.error(f"Gumroad API error: {e}")
+        return jsonify(error='API error'), 500
 
-                # Lire le body (form data)
-                length = int(self.headers.get('Content-Length', 0))
-                if length == 0:
-                    return self._send_json({'error': 'No payload'}, 400)
+    data = resp.json()
+    if resp.status_code != 200 or not data.get('success'):
+        return jsonify(error='Sale verification failed'), 400
 
-                body_bytes = self.rfile.read(length)
-                body_str = body_bytes.decode('utf-8')
-                
-                # Parser form data (application/x-www-form-urlencoded)
-                from urllib.parse import parse_qs
-                form_data = parse_qs(body_str)
-                
-                # Gumroad envoie sale_id, email, etc.
-                sale_id = form_data.get('sale_id', [None])[0]
-                email = form_data.get('email', [None])[0]
-                
-                if not sale_id:
-                    logging.warning(f"Gumroad webhook: missing sale_id from {ip}")
-                    return self._send_json({'error': 'Missing sale_id'}, 400)
-                
-                # Vérifier si déjà traité (replay attack)
-                c.execute('SELECT sale_id FROM processed_sales WHERE sale_id = ?', (sale_id,))
-                if c.fetchone():
-                    logging.warning(f"Gumroad webhook: duplicate sale_id {sale_id} from {ip}")
-                    return self._send_json({'error': 'Already processed'}, 400)
-                
-                # Vérifier avec l'API Gumroad
-                if not GUMROAD_ACCESS_TOKEN:
-                    logging.error("GUMROAD_ACCESS_TOKEN not configured")
-                    return self._send_json({'error': 'Server misconfiguration'}, 500)
-                
-                try:
-                    verify_response = requests.get(
-                        f'https://api.gumroad.com/v2/sales/{sale_id}',
-                        params={'access_token': GUMROAD_ACCESS_TOKEN},
-                        timeout=10
-                    )
-                    
-                    if verify_response.status_code != 200:
-                        logging.warning(f"Gumroad API verification failed for {sale_id}: {verify_response.status_code}")
-                        return self._send_json({'error': 'Sale verification failed'}, 400)
-                    
-                    sale_data = verify_response.json()
-                    
-                    # Vérifier que la sale est valide
-                    if not sale_data.get('success'):
-                        logging.warning(f"Gumroad sale {sale_id} not valid")
-                        return self._send_json({'error': 'Invalid sale'}, 400)
-                    
-                    # Récupérer l'email de la sale (plus fiable que celui du webhook)
-                    verified_email = sale_data.get('sale', {}).get('email') or email
-                    
-                    if not verified_email:
-                        logging.warning(f"No email in Gumroad sale {sale_id}")
-                        return self._send_json({'error': 'No email found'}, 400)
-                    
-                    # Activer l'accès pour cet utilisateur
-                    c.execute(
-                        'UPDATE users SET subscription_status = ? WHERE email = ?',
-                        ('active', verified_email)
-                    )
-                    
-                    # Enregistrer la sale comme traitée
-                    c.execute(
-                        'INSERT INTO processed_sales (sale_id, email, processed_at) VALUES (?, ?, ?)',
-                        (sale_id, verified_email, datetime.utcnow())
-                    )
-                    
-                    conn.commit()
-                    logging.info(f"Gumroad payment processed: {sale_id} for {verified_email}")
-                    
-                    return self._send_json({'success': True})
-                    
-                except requests.RequestException as e:
-                    logging.error(f"Gumroad API error: {e}")
-                    return self._send_json({'error': 'API communication failed'}, 500)
-            
-            # Toutes les autres routes utilisent _get_body()
-            body = self._get_body()
-            
-            # Route: Register
-            if self.path == '/register':
-                email = sanitize_email(body.get('email', ''))
-                if not email:
-                    return self._send_json({'error': 'Email invalide'}, 400)
-                
-                c.execute('SELECT email FROM users WHERE email = ?', (email,))
-                if c.fetchone():
-                    return self._send_json({'error': 'Email déjà utilisé'}, 400)
-                
-                code = generate_code()
-                
-                c.execute(
-                    'INSERT OR REPLACE INTO codes (email, code, expires_at, attempts) VALUES (?, ?, ?, ?)',
-                    (email, code, datetime.utcnow() + timedelta(minutes=10), 0)
-                )
-                conn.commit()
-                
-                send_email(email, code)
-                logging.info(f"Registration initiated for {email} from {ip}")
-                
-                return self._send_json({'message': 'Code envoyé', 'email': email})
-            
-            # Route: Verify
-            elif self.path == '/verify':
-                email = sanitize_email(body.get('email', ''))
-                code = sanitize_code(body.get('code', ''))
-                
-                if not email or not code:
-                    return self._send_json({'error': 'Données invalides'}, 400)
-                
-                c.execute('SELECT code, expires_at, attempts FROM codes WHERE email = ?', (email,))
-                row = c.fetchone()
-                
-                if not row:
-                    self._log_failed_attempt(ip, email)
-                    return self._send_json({'error': 'Pas de code pour cet email'}, 400)
-                
-                stored_code, expires_at, attempts = row
-                expires_at = datetime.fromisoformat(expires_at)
-                
-                if datetime.utcnow() > expires_at:
-                    c.execute('DELETE FROM codes WHERE email = ?', (email,))
-                    conn.commit()
-                    return self._send_json({'error': 'Code expiré'}, 400)
-                
-                if attempts >= 5:
-                    c.execute('DELETE FROM codes WHERE email = ?', (email,))
-                    conn.commit()
-                    logging.warning(f"Too many attempts for {email} from {ip}")
-                    return self._send_json({'error': 'Trop de tentatives'}, 400)
-                
-                if stored_code != code:
-                    c.execute('UPDATE codes SET attempts = attempts + 1 WHERE email = ?', (email,))
-                    conn.commit()
-                    self._log_failed_attempt(ip, email)
-                    return self._send_json({'error': 'Code incorrect'}, 400)
-                
-                c.execute(
-                    'INSERT INTO users (email, created_at, last_login) VALUES (?, ?, ?)',
-                    (email, datetime.utcnow(), datetime.utcnow())
-                )
-                c.execute('DELETE FROM codes WHERE email = ?', (email,))
-                conn.commit()
-                
-                token = create_token(email)
-                logging.info(f"User {email} verified from {ip}")
-                
-                return self._send_json({'token': token})
-            
-            # Route: Decode
-            elif self.path == '/decode':
-                # Vérifier config AES
-                if not AES_KEY or not AES_IV:
-                    return self._send_json({'error': 'AES not configured'}, 500)
+    verified_email = data.get('sale', {}).get('email') or email
+    if not verified_email:
+        return jsonify(error='No email found'), 400
 
-                # Authentification requise pour /decode
-                auth = self.headers.get('Authorization', '')
-                if not auth.startswith('Bearer '):
-                    return self._send_json({'error': 'Non authentifié'}, 401)
+    db.execute("UPDATE users SET subscription_status = 'active' WHERE email = ?", (verified_email,))
+    db.execute(
+        'INSERT INTO processed_sales (sale_id, email, processed_at) VALUES (?, ?, ?)',
+        (sale_id, verified_email, datetime.utcnow())
+    )
+    db.commit()
 
-                email = verify_token(auth[7:])
-                if not email:
-                    return self._send_json({'error': 'Token invalide'}, 401)
+    logging.info(f"Gumroad payment: {sale_id} for {verified_email}")
+    return jsonify(success=True)
 
-                # Récupérer l'utilisateur et ses infos subscription
-                c.execute(
-                    'SELECT decode_attempts, subscription_status, subscription_ends_at FROM users WHERE email = ?',
-                    (email,)
-                )
-                user_row = c.fetchone()
-                if not user_row:
-                    return self._send_json({'error': 'Utilisateur non trouvé'}, 404)
-
-                decode_attempts, sub_status, sub_ends_at = user_row
-
-                # Au-delà de 3 tentatives : subscription active requise
-                FREE_TIER_LIMIT = 3
-                if decode_attempts >= FREE_TIER_LIMIT:
-                    is_active = sub_status == 'active'
-                    # Vérifier aussi que l'abonnement n'est pas expiré
-                    if is_active and sub_ends_at:
-                        try:
-                            if datetime.fromisoformat(sub_ends_at) < datetime.utcnow():
-                                is_active = False
-                        except (ValueError, TypeError):
-                            is_active = False
-
-                    if not is_active:
-                        logging.warning(f"Decode attempt over free tier limit for {email} (attempts={decode_attempts})")
-                        return self._send_json({
-                            'error': 'subscription_required',
-                            'message': 'Vous avez atteint la limite gratuite (3 déchiffrements). Un abonnement actif est requis pour continuer.',
-                            'decode_attempts': decode_attempts,
-                            'limit': FREE_TIER_LIMIT
-                        }, 402)
-
-                try:
-                    length = int(self.headers.get('Content-Length', 0))
-                    if length == 0:
-                        return self._send_json({'error': 'No data provided'}, 400)
-
-                    encrypted_data = self.rfile.read(length)
-
-                    decrypted = decrypt_aes_cbc(encrypted_data, AES_KEY, AES_IV)
-
-                    if decrypted is None:
-                        return self._send_json({'error': 'Decryption failed'}, 400)
-
-                    # Incrémenter le compteur seulement sur succès
-                    c.execute(
-                        'UPDATE users SET decode_attempts = decode_attempts + 1 WHERE email = ?',
-                        (email,)
-                    )
-                    conn.commit()
-
-                    logging.info(f"Data decrypted successfully for {email} from {ip} (attempt #{decode_attempts + 1})")
-
-                    return self._send_json({
-                        'success': True,
-                        'data': decrypted,
-                        'decode_attempts': decode_attempts + 1,
-                        'limit': FREE_TIER_LIMIT
-                    })
-
-                except Exception as e:
-                    logging.error(f"Decode error: {e}")
-                    return self._send_json({'error': 'Internal error'}, 500)
-            
-            
-            return self._send_json({'error': 'Route non trouvée'}, 404)
-            
-        finally:
-            conn.close()
-    
-    def do_GET(self):
-        ip = self._get_ip()
-        
-        if not check_rate_limit(ip):
-            return self._send_json({'error': 'Trop de requêtes'}, 429)
-        
-        if self.path == '/me':
-            auth = self.headers.get('Authorization', '')
-            if not auth.startswith('Bearer '):
-                return self._send_json({'error': 'Non authentifié'}, 401)
-            
-            token = auth[7:]
-            email = verify_token(token)
-            
-            if not email:
-                return self._send_json({'error': 'Token invalide'}, 401)
-            
-            conn = sqlite3.connect(DB_PATH)
-            c = conn.cursor()
-            c.execute('SELECT created_at, last_login FROM users WHERE email = ?', (email,))
-            row = c.fetchone()
-            conn.close()
-            
-            if not row:
-                return self._send_json({'error': 'Utilisateur non trouvé'}, 404)
-            
-            conn = sqlite3.connect(DB_PATH)
-            c = conn.cursor()
-            c.execute('UPDATE users SET last_login = ? WHERE email = ?', (datetime.utcnow(), email))
-            conn.commit()
-            conn.close()
-            
-            return self._send_json({
-                'email': email,
-                'created_at': row[0],
-                'last_login': row[1]
-            })
-        
-        elif self.path == '/':
-            return self._send_json({
-                'status': 'running',
-                'endpoints': {
-                    'POST /register': 'Créer un compte',
-                    'POST /verify': 'Vérifier le code',
-                    'GET /me': 'Info utilisateur (auth requise)'
-                }
-            })
-        
-        return self._send_json({'error': 'Route non trouvée'}, 404)
-    
-    def log_message(self, format, *args):
-        logging.info(f"{self._get_ip()} - {self.command} {args[0]} - {args[1]}")
+# ─── Entry point ─────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
     init_db()
-    if SECRET_KEY == secrets.token_urlsafe(32):
-        logging.warning("WARNING: Using generated SECRET_KEY - set SECRET_KEY env var for production!")
-    
-    logging.info(f"Server starting on http://{URL}:{PORT}")
-    logging.info(f"Database: {DB_PATH}")
-    logging.info("Using: email-validator + bleach for input sanitization")
-    
-    server = HTTPServer((URL, PORT), Handler)
-    
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        logging.info("Server stopped")
+    app.run(host=HOST, port=PORT)

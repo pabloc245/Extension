@@ -28,9 +28,10 @@ let params = {
   highlight: true,
   color: "yellow",
   network: true,
-  auto: false,
+  auto: true,
   errors: 0,
   mistake: 0,
+  freetrial: true,
   levels: [],
   delais: 1000,
 };
@@ -116,21 +117,28 @@ function parseAndStoreRules(rules) {
   }
   console.log('[DECRYPT] Stored', stored, 'phrases. Total:', phrasesMap.size);
 }
+
 async function decrypt(data) {
   try {
     const res = await fetch(`${API_URL}/decode`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/octet-stream' },
-      body: data  // ArrayBuffer ou Uint8Array
+      body: data  
     });
     
     if (!res.ok) {
+      if(res.status === 402){
+        params.freetrial = false;
+        console.warn('[DECRYPT] Free trial expired');
+      }
       throw new Error(`HTTP ${res.status}`);
     }
     
     const json = await res.json();
-    return json.data;  // Retourne le JSON déchiffré
-    
+
+    console.log('[DECRYPT] Received rules:', json?.data);
+    return json.data;  
+
   } catch (e) {
     console.error('[DECRYPT] Error:', e);
     return null;
@@ -174,7 +182,6 @@ function sendMessageWithTimeout(tabId, message, options = {}) {
       throw err;
     });
 }
-
 browser.runtime.onMessage.addListener((message, sender) => {
   try {
     if (message.type == "PHRASE_FOUND") {
@@ -182,71 +189,69 @@ browser.runtime.onMessage.addListener((message, sender) => {
         console.error('[DECRYPT] Invalid message format');
         return;
       }
-
       const fullText = message.texte;
       const phraseResult = checkPhrase(fullText);
-
       if (!phraseResult.hasMistake) {
         sendMessageWithTimeout(
           sender.tab.id,
-          { type: "NO_MISTAKE" },
+          { type: "NO_MISTAKE",
+            auto: params.auto,
+           },
           { frameId: sender.frameId }
-        ).catch(() => {});
+        )
+        .then(response => console.log('[BG] NO_MISTAKE response:', response))
+        .catch(err => console.warn('[BG] NO_MISTAKE failed:', err));
         return;
       }
 
       if (!phraseResult.found || !phraseResult.hasMistake) return;
-
       const targetText = phraseResult.mistakeText;
       if (!targetText) {
         console.warn('[DECRYPT] No mistake text found');
         return;
       }
-
       const index = message.texteArray.findIndex(part => part.trim() === targetText.trim().split(/\s+/)[0]);
 
       if (index === -1) {
         console.warn('[DECRYPT] Target not found in array:', targetText);
         return;
       }
-
+      
       const sendMessage = () => {
-          sendMessageWithTimeout(
-            sender.tab.id,
-            {
-              type: "MODIFY_ELEMENT",
-              index,
-              auto: params.auto,
-              highlight: params.highlight,
-              styles: { backgroundColor: String(params.color) }
-            },
-            { frameId: sender.frameId }
-          ).catch(() => {});
-        };
-
-        if (params.auto && params.delais > 0) {
-          const now = Date.now();
-          const timeSinceLastSend = now - lastSendTime;
-          const del = params.delais;
-          const randomDelay = Math.floor(Math.random() * (del - del/2) + del/2);
-          const actualDelay = Math.max(randomDelay, params.delais - timeSinceLastSend);
-
-          
-          setTimeout(() => {
-            lastSendTime = Date.now();
-            sendMessage();
-          }, actualDelay);
-        } else {
+        sendMessageWithTimeout(
+          sender.tab.id,
+          {
+            type: "MODIFY_ELEMENT",
+            index,
+            auto: params.auto,
+            highlight: params.highlight,
+            styles: { backgroundColor: String(params.color) }
+          },
+          { frameId: sender.frameId }
+        ).catch(() => {});
+      };
+      
+      // Envoi immédiat ou avec délai
+      if (params.auto && params.delais > 0) {
+        const now = Date.now();
+        const timeSinceLastSend = now - lastSendTime;
+        const del = params.delais;
+        const randomDelay = Math.floor(Math.random() * (del - del/2) + del/2);
+        const actualDelay = Math.max(randomDelay, params.delais - timeSinceLastSend);
+        
+        setTimeout(() => {
+          lastSendTime = Date.now();
           sendMessage();
-        }
+        }, actualDelay);
+      } else {
+        sendMessage(); 
+      }
     }
-
     if (message.type === "UPDATE_PARAMS") {
       updateParams(message.payload);
       saveParams();
       return Promise.resolve({ ok: true, params });
     }
-
     if (message.type === "GET_PARAMS") {
       return Promise.resolve(params);
     }
@@ -255,6 +260,7 @@ browser.runtime.onMessage.addListener((message, sender) => {
     return Promise.reject(e);
   }
 });
+
 
 browser.webRequest.onBeforeRequest.addListener(
   (details) => {
@@ -265,7 +271,10 @@ browser.webRequest.onBeforeRequest.addListener(
       if (!match) return {};
       
       const levelId = match[1];
-      if (seenLevels.has(levelId)) return {};
+      if (seenLevels.has(levelId)){
+        console.log('[DECRYPT] Level already seen, skipping:', levelId);
+        return {};
+      }
       
       console.log('[DECRYPT] Intercepting level', levelId);
       
@@ -293,7 +302,7 @@ browser.webRequest.onBeforeRequest.addListener(
           closeFilter();
         }
       };
-      
+          
       filter.onstop = async () => {
         try {
           const totalLength = chunks.reduce((acc, c) => acc + c.length, 0);
@@ -304,15 +313,31 @@ browser.webRequest.onBeforeRequest.addListener(
             offset += chunk.length;
           }
           
+          // Check si déjà en clair (pas chiffré)
           const firstChar = String.fromCharCode(combined[0]);
           if (firstChar === '{' || firstChar === '[') {
             closeFilter();
             return;
           }
           
-          seenLevels.add(levelId);
-          await decrypt(combined);
+          // Déchiffrer via serveur
+          const result = await decrypt(combined);
+          if (!result) {
+            console.log('[DECRYPT] Decrypt failed for level', levelId);
+            return;
+          }
+          
+          // result est déjà l'objet JSON déchiffré
+          console.log('[DECRYPT] Decrypted successfully');
+          if (result?.rules) {
+            parseAndStoreRules(result.rules);
+            params.errors = phrasesMap.size;
+            params.levels = seenLevels;
+          }
+          
           closeFilter();
+          seenLevels.add(levelId);
+          
         } catch (e) {
           console.error('[DECRYPT] Filter onstop error:', e);
           closeFilter();
@@ -330,7 +355,7 @@ browser.webRequest.onBeforeRequest.addListener(
       return {};
     }
   },
-  { urls: ["https://apprentissage.appli3.projet-voltaire.fr/*", "https://content-prd.projet-voltaire.fr/v55/*"]},
+  { urls: ["https://apprentissage.appli3.projet-voltaire.fr/*", "https://content-prd.projet-voltaire.fr/v55/*",  "http://localhost:8000/*"]},
   ["blocking"]
 );
 

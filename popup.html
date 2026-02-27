@@ -9,32 +9,33 @@
 <body>
 <div id="app">
   <!-- LOGIN VIEW -->
-  <div id="login-view" class="view">
+  <div id="login-view" class="view active">
     <div class="login-form">
       <input type="email" id="email" placeholder="email">
-      <input type="text" id="code" placeholder="code">
+      <input type="text" id="code" placeholder="code" class="hidden">
       <button id="login-btn">VERIFY</button>
       <div id="login-error"></div>
     </div>
   </div>
+  <!-- PAYMENT VIEW -->
+  <div id="payment-view" class="view">
+    <div class="payment-form">
+      <div id="text-error">Acceder à toutes les fonctionnalités de l'extension</div>
+      <button id="payment-btn" href="https://kbhnb.gumroad.com/l/candide">4,88€</button>
+    </div>
+  </div>
 
   <!-- MAIN VIEW -->
-  <div id="main-view" class="view" style="display:none">
+  <div id="main-view" class="view">
     <!-- STATS -->
     <div class="box">
       <div class="box-title">Stats</div>
       <div class="top">
-        <canvas id="gauge" width="120" height="120"></canvas>
         <div class="stats">
           <div><span id="err">0</span> ERR</div>
           <div><span id="ok">0</span> OK</div>
           <button id="reset">RESET</button>
         </div>
-      </div>
-      <div class="delais-rectangles">
-        <div class="delay-rect"></div>
-        <div class="delay-rect"></div>
-        <div class="delay-rect"></div>
       </div>
       <div class="delais-controls">
         <button id="delay-minus">-</button>

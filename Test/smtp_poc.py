@@ -7,6 +7,10 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import os
 import logging
+from dotenv import load_dotenv
+
+load_dotenv()
+
 
 logging.basicConfig(level=logging.INFO)
 def send_email(email, code):
@@ -21,8 +25,8 @@ def send_email(email, code):
     """
     smtp_host ="smtp.gmail.com"
     smtp_port = int(os.getenv('SMTP_PORT', '587'))
-    smtp_user = "kbhnb90@gmail.com"
-    smtp_password = "iciphtshlyqosopi"
+    smtp_user = 'kbhnb90@gmail.com'
+    smtp_password = os.getenv('SMTP_PASSWORD', 'NOT SET')
     
     # Mode dev - affiche le code
     if not smtp_host or not smtp_user or not smtp_password:
@@ -43,7 +47,7 @@ def send_email(email, code):
         text = f"""
             Votre code de verification: {code}
 
-            Ce code expire dans 10 minutes.
+            Ce code expire dans 10 minute
 
             Si vous n'avez pas demande ce code, ignorez cet email.
             """

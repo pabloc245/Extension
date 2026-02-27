@@ -1,243 +1,269 @@
-const SIZE = 100;
-const CENTER = SIZE / 2;
-const RADIUS_BG = 45;
-const RADIUS_FG = 45;
-const LINE_BG = 10;
-const LINE_FG = 10;
-const API_URL = 'http://localhost:8000'; 
+// ─── Config ────────────────────────────────────────────────────────────────
 
+const API_URL = 'http://localhost:8000';
 
-let stats = { err: 10, ok: 0, levels: [] };
-let params = { highlight: false, color: "yellow", network: true, auto: false, delais: 1000 };
-let canvas, ctx;
+// const GAUGE = {
+//   SIZE: 100,
+//   get CENTER() { return this.SIZE / 2; },
+//   RADIUS: 45,
+//   LINE: 10,
+// };
 
-function showLogin() {
-  document.getElementById('login-view').style.display = 'flex';
-  document.getElementById('main-view').style.display = 'none';
+// ─── State ─────────────────────────────────────────────────────────────────
+
+let stats  = { err: 10, ok: 0, levels: [] };
+let params = { highlight: false, color: 'yellow', network: true, auto: false, delais: 1000 };
+let ctx    = null;
+
+// ─── Views ─────────────────────────────────────────────────────────────────
+
+const VIEWS = ['login-view', 'main-view', 'payment-view'];
+
+function showView(id) {
+  VIEWS.forEach(v => {
+    document.getElementById(v).classList.toggle('active', v === id);
+  });
 }
 
-function showMain() {
-  document.getElementById('login-view').style.display = 'none';
-  document.getElementById('main-view').style.display = 'flex';
-}
+const showLogin   = () => showView('login-view');
+const showMain    = () => showView('main-view');
+const showPayment = () => showView('payment-view');
 
-function drawGauge() {
-  if (!ctx) return;
-  const total = stats.err + stats.ok || 1;
-  const ratio = stats.err / total;
+// ─── Gauge ─────────────────────────────────────────────────────────────────
 
-  ctx.clearRect(0, 0, SIZE, SIZE);
-  ctx.lineWidth = LINE_BG;
-  ctx.beginPath();
-  ctx.strokeStyle = '#7fff7f';
-  ctx.arc(CENTER, CENTER, RADIUS_BG, 0, Math.PI * 2);
-  ctx.stroke();
+// function drawGauge() {
+//   if (!ctx) return;
+//   const { SIZE, CENTER, RADIUS, LINE } = GAUGE;
+//   const ratio = stats.err / (stats.err + stats.ok || 1);
 
-  ctx.lineWidth = LINE_FG;
-  ctx.beginPath();
-  ctx.strokeStyle = '#be1f27';
-  ctx.arc(CENTER, CENTER, RADIUS_FG, -Math.PI / 2, Math.PI * 2 * ratio - Math.PI / 2);
-  ctx.stroke();
-}
+//   ctx.clearRect(0, 0, SIZE, SIZE);
+
+//   ctx.lineWidth   = LINE;
+//   ctx.strokeStyle = '#7fff7f';
+//   ctx.beginPath();
+//   ctx.arc(CENTER, CENTER, RADIUS, 0, Math.PI * 2);
+//   ctx.stroke();
+
+//   ctx.strokeStyle = '#be1f27';
+//   ctx.beginPath();
+//   ctx.arc(CENTER, CENTER, RADIUS, -Math.PI / 2, Math.PI * 2 * ratio - Math.PI / 2);
+//   ctx.stroke();
+// }
+
+// ─── Render ─────────────────────────────────────────────────────────────────
 
 function render() {
-  document.getElementById('err').textContent = stats.err;
-  document.getElementById('ok').textContent = stats.ok;
-  document.getElementById("delay-value").textContent = params.delais;
-  
+  document.getElementById('err').textContent         = stats.err;
+  document.getElementById('ok').textContent          = stats.ok;
+  document.getElementById('delay-value').textContent = params.delais;
+
   const list = document.getElementById('list');
   list.innerHTML = '';
   stats.levels.slice(-12).forEach(l => {
-    const li = document.createElement('li');
+    const li      = document.createElement('li');
     li.textContent = `level_${l.id}.json`;
-    li.className = l.err ? 'err' : 'ok';
+    li.className   = l.err ? 'err' : 'ok';
     list.appendChild(li);
   });
-  
-  drawGauge();
+
+  //drawGauge();
 }
+
+// ─── Messaging ─────────────────────────────────────────────────────────────
 
 function updateParam(partial) {
-  return browser.runtime.sendMessage({ type: "UPDATE_PARAMS", payload: partial });
+  return browser.runtime.sendMessage({ type: 'UPDATE_PARAMS', payload: partial });
 }
 
+// ─── Login ─────────────────────────────────────────────────────────────────
+
 function initLogin() {
-  const loginBtn = document.getElementById('login-btn');
+  const loginBtn   = document.getElementById('login-btn');
   const emailInput = document.getElementById('email');
-  const codeInput = document.getElementById('code');
-  const errorEl = document.getElementById('login-error');
+  const codeInput  = document.getElementById('code');
+  const errorEl    = document.getElementById('login-error');
 
-  const doLogin = async () => {
+  function setError(msg, isSuccess = false) {
+    errorEl.style.color = isSuccess ? '#7fff7f' : '';
+    errorEl.textContent = msg;
+  }
+
+  function setLoading(loading) {
+    loginBtn.disabled    = loading;
+    loginBtn.textContent = loading ? 'SENDING...' : 'VERIFY';
+  }
+
+  codeInput.classList.add('hidden');
+
+  async function doLogin() {
     const email = emailInput.value.trim();
-    const code = codeInput.value.trim();
-    errorEl.textContent = '';
+    const code  = codeInput.value.trim();
+    setError('');
 
-    if (!email) {
-      errorEl.textContent = 'Email required';
-      return;
-    }
+    if (!email) { setError('Email required'); return; }
 
-    if (!code) {
+    if (!code && codeInput.classList.contains('hidden')) {
+      // Step 1: request code
+      setLoading(true);
       try {
-        loginBtn.disabled = true;
-        loginBtn.textContent = 'SENDING...';
-        
-        const res = await fetch(`${API_URL}/register`, {
+        const res  = await fetch(`${API_URL}/register`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ email })
+          body: JSON.stringify({ email }),
         });
-
         const data = await res.json();
-
         if (res.ok) {
-          errorEl.style.color = '#7fff7f';
-          errorEl.textContent = 'Code sent to email';
+          setError('Code sent to email', true);
+          console.log('Remove hidden class from code input');
+          codeInput.classList.remove('hidden');
           codeInput.focus();
         } else {
-          errorEl.textContent = data.error || 'Registration failed';
+          setError(data.error || 'Registration failed');
         }
-      } catch (e) {
-        console.error('[POPUP] Register error:', e);
-        errorEl.textContent = 'Network error';
+      } catch(e) {
+        setError('Network error: ', e);
       } finally {
-        loginBtn.disabled = false;
-        loginBtn.textContent = 'VERIFY';
+        setLoading(false);
       }
       return;
     }
 
+    // Step 2: verify code
+    loginBtn.disabled    = true;
+    loginBtn.textContent = 'VERIFYING...';
     try {
-      loginBtn.disabled = true;
-      loginBtn.textContent = 'VERIFYING...';
-
-      const res = await fetch(`${API_URL}/verify`, {
+      const res  = await fetch(`${API_URL}/verify`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, code })
+        body: JSON.stringify({ email, code }),
       });
-
       const data = await res.json();
-
       if (res.ok) {
-        await browser.storage.local.set({ 
-          authToken: data.token || email, 
-          authEmail: email 
-        });
+        await browser.storage.local.set({ authToken: data.token || email, authEmail: email });
         showMain();
         initMain();
       } else {
-        errorEl.textContent = data.error || 'Invalid code';
+        setError(data.error || 'Invalid code');
       }
-    } catch (e) {
-      console.error('[POPUP] Verify error:', e);
-      errorEl.textContent = 'Network error';
+    } catch {
+      setError('Network error');
     } finally {
-      loginBtn.disabled = false;
+      loginBtn.disabled    = false;
       loginBtn.textContent = 'VERIFY';
     }
-  };
+  }
 
   loginBtn.onclick = doLogin;
-  
-  emailInput.addEventListener('keypress', (e) => {
-    if (e.key === 'Enter') {
-      e.preventDefault();
-      doLogin();
-    }
-  });
-  
-  codeInput.addEventListener('keypress', (e) => {
-    if (e.key === 'Enter') {
-      e.preventDefault();
-      doLogin();
-    }
+  [emailInput, codeInput].forEach(el =>
+    el.addEventListener('keypress', e => e.key === 'Enter' && (e.preventDefault(), doLogin()))
+  );
+}
+
+// ─── Payment ────────────────────────────────────────────────────────────────
+
+function initPayment() {
+  const PAYMENT_URL = 'https://kbhnb.gumroad.com/l/candide';
+  browser.storage.local.get(['authEmail']).then(({ authEmail = '' }) => {
+    const url = new URL(PAYMENT_URL);
+    url.searchParams.set('email', authEmail);
+    document.getElementById('payment-btn').href = url.toString();
   });
 }
 
+// ─── Main ───────────────────────────────────────────────────────────────────
+
 function initMain() {
-  canvas = document.getElementById('gauge');
-  ctx = canvas.getContext('2d');
-  const dpr = window.devicePixelRatio || 1;
-  canvas.width = SIZE * dpr;
-  canvas.height = SIZE * dpr;
-  canvas.style.width = canvas.style.height = `${SIZE}px`;
-  ctx.scale(dpr, dpr);
-  ctx.lineCap = 'round';
+  const dpr    = window.devicePixelRatio || 1;
+  
+  // Controls mapping: [elementId, event, paramKey, getValue]
+  const controls = [
+    ['auto',     'change', 'auto',      el => el.checked],
+    ['hl',       'change', 'highlight', el => el.checked],
+    ['net',      'change', 'network',   el => el.checked],
+    ['hlColor',  'input',  'color',     el => String(el.value)],
+  ];
 
-  const els = {
-    auto: document.getElementById("auto"),
-    highlight: document.getElementById("hl"),
-    network: document.getElementById("net"),
-    color: document.getElementById("hlColor"),
-    delayPlus: document.getElementById("delay-plus"),
-    delayMinus: document.getElementById("delay-minus"),
-    reset: document.getElementById("reset")
-  };
-
-  els.auto?.addEventListener("change", () => {
-    params.auto = els.auto.checked;
-    updateParam({ auto: params.auto });
+  controls.forEach(([id, event, key, getValue]) => {
+    document.getElementById(id)?.addEventListener(event, ({ target }) => {
+      params[key] = getValue(target);
+      updateParam({ [key]: params[key] });
+    });
   });
 
-  els.highlight?.addEventListener("change", () => {
-    params.highlight = els.highlight.checked;
-    updateParam({ highlight: params.highlight });
+  document.getElementById('delay-plus')?.addEventListener('click', () => {
+    if (params.delais >= 5000) return;
+    params.delais += 100;
+    updateParam({ delais: params.delais });
+    render();
   });
 
-  els.network?.addEventListener("change", () => {
-    params.network = els.network.checked;
-    updateParam({ network: params.network });
+  document.getElementById('delay-minus')?.addEventListener('click', () => {
+    if (params.delais <= 0) return;
+    params.delais -= 100;
+    updateParam({ delais: params.delais });
+    render();
   });
 
-  els.color?.addEventListener("input", () => {
-    params.color = String(els.color.value);
-    updateParam({ color: params.color });
-  });
-
-  els.delayPlus?.addEventListener("click", () => {
-    if (params.delais < 5000) {
-      params.delais += 100;
-      updateParam({ delais: params.delais });
-      render();
-    }
-  });
-
-  els.delayMinus?.addEventListener("click", () => {
-    if (params.delais > 0) {
-      params.delais -= 100;
-      updateParam({ delais: params.delais });
-      render();
-    }
-  });
-
-  els.reset?.addEventListener("click", () => {
+  document.getElementById('reset')?.addEventListener('click', () => {
     params.delais = 1000;
     updateParam({ delais: params.delais });
     render();
   });
 
-  browser.runtime.sendMessage({ type: "GET_PARAMS" })
+  browser.runtime.sendMessage({ type: 'GET_PARAMS' })
     .then(p => {
       if (!p) return;
-      els.auto.checked = !!p.auto;
-      els.highlight.checked = !!p.highlight;
-      els.network.checked = !!p.network;
-      els.color.value = p.color || params.color;
-      params.delais = p.delais || params.delais;
-      stats.levels = [...(p.levels || [])].map(id => ({ id }));
-      stats.err = p.errors || 0;
+      document.getElementById('auto').checked    = !!p.auto;
+      document.getElementById('hl').checked      = !!p.highlight;
+      document.getElementById('net').checked     = !!p.network;
+      document.getElementById('hlColor').value   = p.color || params.color;
+      params.delais  = p.delais || params.delais;
+      stats.levels   = (p.levels || []).map(id => ({ id }));
+      stats.err      = p.errors || 0;
       render();
     })
     .catch(() => render());
 }
 
-browser.storage.local.get(['authToken']).then(result => {
-  if (result.authToken) {
-    showMain();
-    initMain();
-  } else {
+showMain();
+initMain();
+
+// ─── Boot ───────────────────────────────────────────────────────────────────
+
+browser.storage.local.get(['authToken']).then(async ({ authToken }) => {
+  return;
+
+  if (!authToken) {
+    console.log('No auth token found, showing login');
     showLogin();
     initLogin();
-  } 
+    return;
+  }
+
+  try {
+    const res = await fetch(`${API_URL}/me`, {
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${authToken}` },
+    });
+
+    if (res.ok) {
+      const { subscription_status } = await res.json();
+      if (subscription_status === 'active') {
+        console.log('User authenticated with active subscription');
+        showMain();
+        initMain();
+      } else {
+        console.log('User authenticated but no active subscription');
+        showPayment();
+        initPayment();
+      }
+    } else {
+      console.log('Authentication failed, showing login');
+      showLogin();
+      initLogin();
+    }
+  } catch {
+    console.log('Network error during authentication, showing login');
+    showMain();
+    initMain();
+  }
 });
