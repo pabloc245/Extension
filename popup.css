@@ -37,7 +37,7 @@ body{margin:0;background:#000;color:#fff}
 .stats div{font-size:13px}
 
 #reset{
-  margin-top:6px;
+  margin:6px;
   font-size:10px;
   background:#000;
   border:1px solid #fff;
@@ -79,10 +79,6 @@ body{margin:0;background:#000;color:#fff}
   gap:8px;
   margin:10px 0;
 }
-.delay-rect{
-  width:30px;
-  height:20px;
-}
 .delais-controls{
   display:flex;
   align-items:center;
@@ -94,7 +90,7 @@ body{margin:0;background:#000;color:#fff}
   height:18px;
   background:#000;
   color:#fff;
-  border:2px solid #fff;
+  border:1.5px solid #fff;
   font-weight:bold;
   cursor:pointer;
   display:flex;
@@ -164,22 +160,25 @@ input:checked + .slider:before{
 /* PAYMENT */
 .payment-form{
   display:flex;
+  text-align: center;
   flex-direction:column;
   align-items:stretch;
   font-size:11px;
   gap:10px;
   width:220px;
 }
-.payment-form button{
-  background:#000;
-  border:1px solid #fff;
-  color:#fff;
-  padding:10px 20px;
-  font-size:11px;
-  font-weight:700;
-  letter-spacing:1px;
-  cursor:pointer;
-  align-self:center;
+.payment-form a {
+  display: inline-block;
+  background: #000;
+  border: 1px solid #fff;
+  color: #fff;
+  padding: 10px 20px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  cursor: pointer;
+  align-self: center;
+  text-decoration: none;
 }
 
 /* LOGIN */

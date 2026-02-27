@@ -375,12 +375,12 @@ def me():
 
 @app.post('/decode')
 @rate_limited
-#@require_auth
+@require_auth
 def decode():
     if not AES_KEY or not AES_IV:
         return jsonify(error='AES not configured'), 500
 
-    """db  = get_db()
+    db  = get_db()
     row = db.execute(
         'SELECT decode_attempts, subscription_status, subscription_ends_at FROM users WHERE email = ?',
         (g.email,)
@@ -404,7 +404,7 @@ def decode():
                 message=f'Limite gratuite atteinte ({FREE_TIER_LIMIT} déchiffrements).',
                 decode_attempts =0,#decode_attempts=attempts,
                 limit=FREE_TIER_LIMIT,
-            ), 402"""
+            ), 402
 
     data = request.get_data()
     if not data:
@@ -413,17 +413,17 @@ def decode():
     decrypted = decrypt_aes_cbc(data)
     if decrypted is None:
         return jsonify(error='Decryption failed'), 400
-    """db.execute('UPDATE users SET decode_attempts = decode_attempts + 1 WHERE email = ?', (g.email,))
-    db.commit()"""
+    db.execute('UPDATE users SET decode_attempts = decode_attempts + 1 WHERE email = ?', (g.email,))
+    db.commit()
 
-    attempts = 0 #row['decode_attempts']
-    #logging.info(f"Decrypted for {g.email} from {get_client_ip()} (attempt #{attempts + 1})")
+    row['decode_attempts']
+    logging.info(f"Decrypted for {g.email} from {get_client_ip()} (attempt #{attempts + 1})")
     return jsonify(success=True, data=decrypted, decode_attempts=attempts + 1, limit=FREE_TIER_LIMIT)
 
-@app.post('/webhook/<secret>')
+@app.post('/webhook')
 @rate_limited
 def webhook(secret):
-    if not GUMROAD_WEBHOOK_SECRET or secret != GUMROAD_WEBHOOK_SECRET:
+    if not secret != GUMROAD_WEBHOOK_SECRET:
         logging.warning(f"Webhook: invalid secret from {get_client_ip()}")
         return jsonify(error='Unauthorized'), 401
 

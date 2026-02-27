@@ -47,7 +47,7 @@ def send_email(email, code):
         text = f"""
             Votre code de verification: {code}
 
-            Ce code expire dans 10 minute
+            Ce code expire dans 10 minutes
 
             Si vous n'avez pas demande ce code, ignorez cet email.
             """

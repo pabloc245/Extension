@@ -129,7 +129,7 @@ async function decrypt(data) {
     if (!res.ok) {
       if(res.status === 402){
         params.freetrial = false;
-        console.warn('[DECRYPT] Free trial expired');
+        console.warn('[DECRYPT] Free trial fully used');
       }
       throw new Error(`HTTP ${res.status}`);
     }
@@ -250,6 +250,15 @@ browser.runtime.onMessage.addListener((message, sender) => {
     if (message.type === "UPDATE_PARAMS") {
       updateParams(message.payload);
       saveParams();
+      browser.tabs.query({ active: true, currentWindow: true })
+      .then((tabs) => {
+          browser.tabs.sendMessage(tabs[0].id, {
+              type: "FORCE_RECHECK"
+          })
+          .then(response => {})
+          .catch(err => {console.error('[DECRYPT] Send failed:', err); });
+      });
+
       return Promise.resolve({ ok: true, params });
     }
     if (message.type === "GET_PARAMS") {

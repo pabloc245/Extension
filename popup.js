@@ -2,13 +2,6 @@
 
 const API_URL = 'http://localhost:8000';
 
-// const GAUGE = {
-//   SIZE: 100,
-//   get CENTER() { return this.SIZE / 2; },
-//   RADIUS: 45,
-//   LINE: 10,
-// };
-
 // ─── State ─────────────────────────────────────────────────────────────────
 
 let stats  = { err: 10, ok: 0, levels: [] };
@@ -28,27 +21,6 @@ function showView(id) {
 const showLogin   = () => showView('login-view');
 const showMain    = () => showView('main-view');
 const showPayment = () => showView('payment-view');
-
-// ─── Gauge ─────────────────────────────────────────────────────────────────
-
-// function drawGauge() {
-//   if (!ctx) return;
-//   const { SIZE, CENTER, RADIUS, LINE } = GAUGE;
-//   const ratio = stats.err / (stats.err + stats.ok || 1);
-
-//   ctx.clearRect(0, 0, SIZE, SIZE);
-
-//   ctx.lineWidth   = LINE;
-//   ctx.strokeStyle = '#7fff7f';
-//   ctx.beginPath();
-//   ctx.arc(CENTER, CENTER, RADIUS, 0, Math.PI * 2);
-//   ctx.stroke();
-
-//   ctx.strokeStyle = '#be1f27';
-//   ctx.beginPath();
-//   ctx.arc(CENTER, CENTER, RADIUS, -Math.PI / 2, Math.PI * 2 * ratio - Math.PI / 2);
-//   ctx.stroke();
-// }
 
 // ─── Render ─────────────────────────────────────────────────────────────────
 
@@ -225,9 +197,8 @@ function initMain() {
     .catch(() => render());
 }
 
-showMain();
-initMain();
-
+showPayment();
+initPayment();
 // ─── Boot ───────────────────────────────────────────────────────────────────
 
 browser.storage.local.get(['authToken']).then(async ({ authToken }) => {
@@ -247,7 +218,10 @@ browser.storage.local.get(['authToken']).then(async ({ authToken }) => {
 
     if (res.ok) {
       const { subscription_status } = await res.json();
-      if (subscription_status === 'active') {
+      /////////////////////////
+      ///REMOVE BEFORE PROD///
+      ///////////////////////
+      if (subscription_status === 'active' || 1) { 
         console.log('User authenticated with active subscription');
         showMain();
         initMain();
@@ -256,7 +230,7 @@ browser.storage.local.get(['authToken']).then(async ({ authToken }) => {
         showPayment();
         initPayment();
       }
-    } else {
+    } else {  
       console.log('Authentication failed, showing login');
       showLogin();
       initLogin();
