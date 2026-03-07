@@ -23,41 +23,46 @@ from email_validator import validate_email, EmailNotValidError
 from dotenv import load_dotenv
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
+from google.cloud import secretmanager
+
+# ─── Secret Manager ──────────────────────────────────────────────────────────
+
+GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID")
+if not GCP_PROJECT_ID:
+    raise RuntimeError("GCP_PROJECT_ID must be set in environment")
+
+_sm_client = secretmanager.SecretManagerServiceClient()
+
+def get_secret(secret_id: str, default: str = None) -> str:
+    try:
+        name     = f"projects/{GCP_PROJECT_ID}/secrets/{secret_id}/versions/latest"
+        response = _sm_client.access_secret_version(request={"name": name})
+        return response.payload.data.decode("UTF-8").strip()
+    except Exception as e:
+        if default is not None:
+            logging.warning(f"Secret '{secret_id}' not found, using default: {e}")
+            return default
+        raise RuntimeError(f"Failed to load required secret '{secret_id}': {e}")
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 
-load_dotenv()
+SECRET_KEY             = get_secret("SECRET_KEY")
+ALLOWED_ORIGINS        = set(get_secret("ALLOWED_ORIGINS").split(","))
+SMTP_HOST              = get_secret("SMTP_HOST",              default="")
+SMTP_USER              = get_secret("SMTP_USER",              default="")
+SMTP_PASSWORD          = get_secret("SMTP_PASSWORD",          default="")
+AES_KEY                = get_secret("AES_KEY",                default="")
+AES_IV                 = get_secret("AES_IV",                 default="")
+GUMROAD_WEBHOOK_SECRET = get_secret("GUMROAD_WEBHOOK_SECRET", default="")
+GUMROAD_ACCESS_TOKEN   = get_secret("GUMROAD_ACCESS_TOKEN",   default="")
+TRUSTED_PROXIES        = set(get_secret("TRUSTED_PROXIES",    default="").split(",")) - {""}
 
-SECRET_KEY = os.getenv("SECRET_KEY")
-if not SECRET_KEY:
-    raise RuntimeError("SECRET_KEY must be set in environment")  # FIX #1 — plus de fallback silencieux
+PORT    = int(os.getenv("PORT",    "8000"))
+HOST    =     os.getenv("HOST",    "localhost")
+DB_PATH =     os.getenv("DB_PATH", "auth.db")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 
-PORT    = int(os.getenv("PORT", "8000"))
-HOST    = os.getenv("HOST", "localhost")
-DB_PATH = os.getenv("DB_PATH", "auth.db")
-
-ALLOWED_ORIGIN = os.getenv("ALLOWED_ORIGIN")
-if not ALLOWED_ORIGIN:
-    raise RuntimeError("ALLOWED_ORIGIN must be set in environment")  # FIX #8 — obligatoire en prod
-
-SMTP_HOST     = os.getenv("SMTP_HOST")
-SMTP_PORT     = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER     = os.getenv("SMTP_USER")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
-
-AES_KEY = os.getenv("AES_KEY", "")
-AES_IV  = os.getenv("AES_IV", "")
-
-GUMROAD_WEBHOOK_SECRET = os.getenv("GUMROAD_WEBHOOK_SECRET")
-GUMROAD_ACCESS_TOKEN   = os.getenv("GUMROAD_ACCESS_TOKEN")
-
-TRUSTED_PROXIES = {
-    ip.strip()
-    for ip in os.getenv("TRUSTED_PROXIES", "").split(",")
-    if ip.strip()
-}
-
-FREE_TIER_LIMIT = 2
+FREE_TIER_LIMIT = os.getenv("FREE_TIER_LIMIT", "2")
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 
@@ -129,10 +134,8 @@ def init_db():
             except sqlite3.OperationalError:
                 pass
 
-# FIX #15 — init compatible gunicorn
+# init compatible gunicorn
 with app.app_context():
-    # On ne peut pas appeler get_db() ici (pas de request context),
-    # donc on appelle init_db() directement qui ouvre sa propre connexion
     pass
 
 # ─── Sanitizers ──────────────────────────────────────────────────────────────
@@ -254,7 +257,7 @@ def require_auth(f):
 @app.after_request
 def add_headers(resp):
     # FIX #9 — on n'utilise plus l'Origin du client, on utilise ALLOWED_ORIGIN fixe
-    resp.headers['Access-Control-Allow-Origin']  = ALLOWED_ORIGIN
+    resp.headers['Access-Control-Allow-Origin']  = ALLOWED_ORIGINS
     resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
     resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
     resp.headers['X-Content-Type-Options']       = 'nosniff'

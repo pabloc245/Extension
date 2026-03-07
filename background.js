@@ -8,7 +8,7 @@ console.log('[DECRYPT] Background loaded');
 const seenLevels = new Set();
 const phrasesMap = new Map();
 const pendingMessages = new Set();
-const API_URL = 'http://localhost:8000'; 
+const API_URL = 'https://ferney.uk';
 
 
 function normalize(text) {
