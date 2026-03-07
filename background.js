@@ -118,17 +118,47 @@ function parseAndStoreRules(rules) {
   console.log('[DECRYPT] Stored', stored, 'phrases. Total:', phrasesMap.size);
 }
 
+async function getValidToken() {
+    const { authToken, authExpires, refreshToken } = await browser.storage.local.get(
+        ['authToken', 'authExpires', 'refreshToken']
+    );
+    
+    if (Date.now() < new Date(authExpires) - 30000) {
+        return authToken; 
+    }
+    
+    // Refresh
+    const res = await fetch(`${API_URL}/refresh`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refresh_token: refreshToken })
+    });
+    
+    if (res.ok) {
+        const data = await res.json();
+        await browser.storage.local.set({ authToken: data.token, authExpires: data.expires_at });
+        return data.token;
+    }
+    
+    return null;
+}
+
 async function decrypt(data) {
+
+  authToken = await getValidToken();
+  console.log('[DECRYPT] Using token:', authToken);
+    
   try {
     const res = await fetch(`${API_URL}/decode`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/octet-stream' },
+      headers: { 'Content-Type': 'application/octet-stream', Authorization: `Bearer ${authToken}` },
       body: data  
     });
     
     if (!res.ok) {
       if(res.status === 402){
         params.freetrial = false;
+        saveParams();
         console.warn('[DECRYPT] Free trial fully used');
       }
       throw new Error(`HTTP ${res.status}`);
@@ -191,6 +221,9 @@ browser.runtime.onMessage.addListener((message, sender) => {
       }
       const fullText = message.texte;
       const phraseResult = checkPhrase(fullText);
+
+      if (!phraseResult.found || !phraseResult.hasMistake) return;
+      
       if (!phraseResult.hasMistake) {
         sendMessageWithTimeout(
           sender.tab.id,
@@ -204,7 +237,6 @@ browser.runtime.onMessage.addListener((message, sender) => {
         return;
       }
 
-      if (!phraseResult.found || !phraseResult.hasMistake) return;
       const targetText = phraseResult.mistakeText;
       if (!targetText) {
         console.warn('[DECRYPT] No mistake text found');
@@ -253,7 +285,7 @@ browser.runtime.onMessage.addListener((message, sender) => {
       browser.tabs.query({ active: true, currentWindow: true })
       .then((tabs) => {
           browser.tabs.sendMessage(tabs[0].id, {
-              type: "FORCE_RECHECK"
+              type: "FORCE_RECHECK                          "
           })
           .then(response => {})
           .catch(err => {console.error('[DECRYPT] Send failed:', err); });
@@ -291,7 +323,7 @@ browser.webRequest.onBeforeRequest.addListener(
       const chunks = [];
       let filterClosed = false;
       
-      const closeFilter = () => {
+      const closeFilter = () => {   
         if (!filterClosed) {
           filterClosed = true;
           try {

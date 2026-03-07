@@ -5,7 +5,7 @@ const API_URL = 'http://localhost:8000';
 // ─── State ─────────────────────────────────────────────────────────────────
 
 let stats  = { err: 10, ok: 0, levels: [] };
-let params = { highlight: false, color: 'yellow', network: true, auto: false, delais: 1000 };
+let params = { highlight: false, color: 'yellow', network: true, auto: false, delais: 1000, freetrial: true};
 let ctx    = null;
 
 // ─── Views ─────────────────────────────────────────────────────────────────
@@ -38,7 +38,6 @@ function render() {
     list.appendChild(li);
   });
 
-  //drawGauge();
 }
 
 // ─── Messaging ─────────────────────────────────────────────────────────────
@@ -49,7 +48,7 @@ function updateParam(partial) {
 
 // ─── Login ─────────────────────────────────────────────────────────────────
 
-function initLogin() {
+async function initLogin() {
   const loginBtn   = document.getElementById('login-btn');
   const emailInput = document.getElementById('email');
   const codeInput  = document.getElementById('code');
@@ -59,13 +58,20 @@ function initLogin() {
     errorEl.style.color = isSuccess ? '#7fff7f' : '';
     errorEl.textContent = msg;
   }
-
   function setLoading(loading) {
     loginBtn.disabled    = loading;
     loginBtn.textContent = loading ? 'SENDING...' : 'VERIFY';
   }
 
+  // Restore state if extension was closed mid-login
   codeInput.classList.add('hidden');
+  const { pendingEmail } = await browser.storage.local.get(['pendingEmail']);
+  if (pendingEmail) {
+    emailInput.value = pendingEmail;
+    codeInput.classList.remove('hidden');
+    codeInput.focus();
+    setError('Code already sent, check your email', true);
+  }
 
   async function doLogin() {
     const email = emailInput.value.trim();
@@ -85,23 +91,22 @@ function initLogin() {
         });
         const data = await res.json();
         if (res.ok) {
-          setError('Code sent to email', true);
-          console.log('Remove hidden class from code input');
+          await browser.storage.local.set({ pendingEmail: email });
           codeInput.classList.remove('hidden');
           codeInput.focus();
+          setError('Code sent to email', true);
         } else {
           setError(data.error || 'Registration failed');
         }
       } catch(e) {
-        setError('Network error: ', e);
+        setError('Network error');
       } finally {
         setLoading(false);
       }
       return;
     }
 
-    // Step 2: verify code
-    loginBtn.disabled    = true;
+    setLoading(true);
     loginBtn.textContent = 'VERIFYING...';
     try {
       const res  = await fetch(`${API_URL}/verify`, {
@@ -111,7 +116,17 @@ function initLogin() {
       });
       const data = await res.json();
       if (res.ok) {
-        await browser.storage.local.set({ authToken: data.token || email, authEmail: email });
+        if (!data.token || !data.refresh_token) {
+          setError('Server error: no token received');
+          return;
+        }
+        await browser.storage.local.remove(['pendingEmail']);
+        await browser.storage.local.set({
+          authToken:    data.token,
+          authEmail:    email,
+          authExpires:  data.expires_at,
+          refreshToken: data.refresh_token,
+        });
         showMain();
         initMain();
       } else {
@@ -120,7 +135,7 @@ function initLogin() {
     } catch {
       setError('Network error');
     } finally {
-      loginBtn.disabled    = false;
+      setLoading(false);
       loginBtn.textContent = 'VERIFY';
     }
   }
@@ -181,28 +196,34 @@ function initMain() {
     updateParam({ delais: params.delais });
     render();
   });
+  render();
+}
 
-  browser.runtime.sendMessage({ type: 'GET_PARAMS' })
+
+// ─── Boot ───────────────────────────────────────────────────────────────────
+
+function fetchParams() {
+  return browser.runtime.sendMessage({ type: 'GET_PARAMS' })  
     .then(p => {
-      if (!p) return;
-      document.getElementById('auto').checked    = !!p.auto;
-      document.getElementById('hl').checked      = !!p.highlight;
-      document.getElementById('net').checked     = !!p.network;
-      document.getElementById('hlColor').value   = p.color || params.color;
+      console.log('p reçu:', p);
+      if (!p){ 
+        console.error('No params received');
+        return;
+      }
+      params.freetrial = p.freetrial ?? params.freetrial;
+      document.getElementById('auto').checked  = !!p.auto;
+      document.getElementById('hl').checked    = !!p.highlight;
+      document.getElementById('net').checked   = !!p.network;
+      document.getElementById('hlColor').value = p.color || params.color;
       params.delais  = p.delais || params.delais;
       stats.levels   = (p.levels || []).map(id => ({ id }));
       stats.err      = p.errors || 0;
       render();
     })
-    .catch(() => render());
+  .catch(() => render());
 }
 
-showPayment();
-initPayment();
-// ─── Boot ───────────────────────────────────────────────────────────────────
-
-browser.storage.local.get(['authToken']).then(async ({ authToken }) => {
-  return;
+browser.storage.local.get(['authToken']).then(async ({ authToken}) => {
 
   if (!authToken) {
     console.log('No auth token found, showing login');
@@ -212,16 +233,9 @@ browser.storage.local.get(['authToken']).then(async ({ authToken }) => {
   }
 
   try {
-    const res = await fetch(`${API_URL}/me`, {
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${authToken}` },
-    });
-
-    if (res.ok) {
-      const { subscription_status } = await res.json();
-      /////////////////////////
-      ///REMOVE BEFORE PROD///
-      ///////////////////////
-      if (subscription_status === 'active' || 1) { 
+    await fetchParams();
+    if (getValidToken()!=null && 0) {
+      if (params.freetrial == true) { 
         console.log('User authenticated with active subscription');
         showMain();
         initMain();
@@ -241,3 +255,29 @@ browser.storage.local.get(['authToken']).then(async ({ authToken }) => {
     initMain();
   }
 });
+
+
+
+async function getValidToken() {
+    const { authToken, authExpires, refreshToken } = await browser.storage.local.get(
+        ['authToken', 'authExpires', 'refreshToken']
+    );
+    
+    if (Date.now() < new Date(authExpires) - 3000) {
+        return authToken; 
+    }
+    
+    const res = await fetch(`${API_URL}/refresh`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refresh_token: refreshToken })
+    });
+    
+    if (res.ok) {
+        const data = await res.json();
+        await browser.storage.local.set({ authToken: data.token, authExpires: data.expires_at });
+        return data.token;
+    }
+    
+    return null;
+}
